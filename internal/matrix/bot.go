@@ -107,7 +107,7 @@ func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 	case "play":
 		b.cmdPlay(ctx, cmd)
 	case "queue":
-		b.cmdQueue(ctx)
+		b.cmdQueue(ctx, cmd)
 	case "nowplaying":
 		b.cmdNowPlaying(ctx)
 	case "pause":
@@ -152,8 +152,9 @@ func (b *Bot) cmdHelp(ctx context.Context) {
 	lines := [][2]string{
 		{p + "search [artist|album|track|playlist] <query>", "search the library; results are numbered"},
 		{p + "list", "show the last search results again"},
-		{p + "play <n> [n ...]", "queue results by number"},
-		{p + "play <query>", "search and queue the best match"},
+		{p + "play <n> [n ...]", "play results by number right away"},
+		{p + "play <query>", "search and play the best match right away"},
+		{p + "queue <n> | <query>", "add to the end of the queue instead"},
 		{p + "queue", "show the queue"},
 		{p + "nowplaying", "show the current track"},
 		{p + "pause / " + p + "resume", "pause or resume playback"},
@@ -211,52 +212,37 @@ func (b *Bot) cmdList(ctx context.Context) {
 	b.replyResults(ctx, "Last search results", items)
 }
 
+// cmdPlay starts playing the requested items right away. Anything already
+// queued still plays afterwards.
 func (b *Bot) cmdPlay(ctx context.Context, cmd Command) {
 	if cmd.Rest == "" {
 		b.reply(ctx, "Usage: "+b.cfg.Matrix.CommandPrefix+"play <number> or "+b.cfg.Matrix.CommandPrefix+"play <query>", "")
 		return
 	}
-
-	var picked []jellyfin.Item
-	if indexes, ok := intArgs(cmd.Args); ok {
-		for _, index := range indexes {
-			item, err := b.results.resolve(index)
-			if err != nil {
-				b.reply(ctx, err.Error(), "")
-				return
-			}
-			picked = append(picked, item)
-		}
-	} else {
-		// Treat the argument as a search and take the best match, preferring a
-		// track so "!play some song" does not queue a whole artist.
-		items, err := b.jf.Search(ctx, jellyfin.AllKinds, cmd.Rest, b.cfg.Player.SearchLimit)
-		if err != nil {
-			b.reply(ctx, "Search failed: "+err.Error(), "")
-			return
-		}
-		if len(items) == 0 {
-			b.reply(ctx, fmt.Sprintf("Nothing found for %q.", cmd.Rest), "")
-			return
-		}
-		b.results.set(items)
-		picked = append(picked, bestMatch(items))
+	tracks, ok := b.resolveTracks(ctx, cmd)
+	if !ok || len(tracks) == 0 {
+		return
 	}
 
-	var tracks []jellyfin.Item
-	for _, item := range picked {
-		expanded, err := b.jf.Tracks(ctx, item)
-		if err != nil {
-			b.reply(ctx, fmt.Sprintf("Could not expand %s: %v", item.Describe(), err), "")
-			return
-		}
-		if len(expanded) == 0 {
-			b.reply(ctx, fmt.Sprintf("%s has no playable tracks.", item.Describe()), "")
-			continue
-		}
-		tracks = append(tracks, expanded...)
+	added, truncated := b.player.PlayNow(tracks)
+	msg := "Now playing: " + tracks[0].Describe()
+	if added > 1 {
+		msg += fmt.Sprintf(" (+%d more)", added-1)
 	}
-	if len(tracks) == 0 {
+	if truncated {
+		msg += fmt.Sprintf(" Queue limit of %d reached.", b.cfg.Player.MaxQueue)
+	}
+	b.reply(ctx, msg, "")
+}
+
+// cmdQueue appends to the queue, or shows it when given no arguments.
+func (b *Bot) cmdQueue(ctx context.Context, cmd Command) {
+	if cmd.Rest == "" {
+		b.showQueue(ctx)
+		return
+	}
+	tracks, ok := b.resolveTracks(ctx, cmd)
+	if !ok || len(tracks) == 0 {
 		return
 	}
 
@@ -278,6 +264,56 @@ func (b *Bot) cmdPlay(ctx context.Context, cmd Command) {
 	b.reply(ctx, msg, "")
 }
 
+// resolveTracks turns "<number> [number ...]" or "<query>" into playable
+// tracks, expanding artists, albums and playlists. It reports any problem to
+// the room itself and returns false when nothing should be played.
+func (b *Bot) resolveTracks(ctx context.Context, cmd Command) ([]jellyfin.Item, bool) {
+	var picked []jellyfin.Item
+	if indexes, ok := intArgs(cmd.Args); ok {
+		for _, index := range indexes {
+			item, err := b.results.resolve(index)
+			if err != nil {
+				b.reply(ctx, err.Error(), "")
+				return nil, false
+			}
+			picked = append(picked, item)
+		}
+	} else {
+		// Treat the argument as a search and take the best match, preferring a
+		// track so "!play some song" does not pull in a whole artist.
+		items, err := b.jf.Search(ctx, jellyfin.AllKinds, cmd.Rest, b.cfg.Player.SearchLimit)
+		if err != nil {
+			b.reply(ctx, "Search failed: "+err.Error(), "")
+			return nil, false
+		}
+		if len(items) == 0 {
+			b.reply(ctx, fmt.Sprintf("Nothing found for %q.", cmd.Rest), "")
+			return nil, false
+		}
+		b.results.set(items)
+		picked = append(picked, bestMatch(items))
+	}
+
+	var tracks []jellyfin.Item
+	for _, item := range picked {
+		expanded, err := b.jf.Tracks(ctx, item)
+		if err != nil {
+			b.reply(ctx, fmt.Sprintf("Could not expand %s: %v", item.Describe(), err), "")
+			return nil, false
+		}
+		if len(expanded) == 0 {
+			b.reply(ctx, fmt.Sprintf("%s has no playable tracks.", item.Describe()), "")
+			continue
+		}
+		tracks = append(tracks, expanded...)
+	}
+	if len(tracks) == 0 {
+		b.reply(ctx, "Nothing playable in that selection.", "")
+		return nil, false
+	}
+	return tracks, true
+}
+
 func (b *Bot) cmdSkip(ctx context.Context, cmd Command) {
 	indexes, ok := intArgs(cmd.Args)
 	if !ok || len(indexes) != 1 {
@@ -292,7 +328,7 @@ func (b *Bot) cmdSkip(ctx context.Context, cmd Command) {
 	b.reply(ctx, "Now playing: "+item.Describe(), "")
 }
 
-func (b *Bot) cmdQueue(ctx context.Context) {
+func (b *Bot) showQueue(ctx context.Context) {
 	status := b.player.Status()
 	if len(status.Queue) == 0 {
 		b.reply(ctx, "The queue is empty.", "")
@@ -351,8 +387,10 @@ func (b *Bot) replyResults(ctx context.Context, title string, items []jellyfin.I
 		fmt.Fprintf(&htmlOut, "<li><i>%s</i> %s</li>", html.EscapeString(string(item.Kind)), html.EscapeString(item.Describe()))
 	}
 	htmlOut.WriteString("</ol>")
-	fmt.Fprintf(&plain, "Play with %splay <number>", b.cfg.Matrix.CommandPrefix)
-	fmt.Fprintf(&htmlOut, "Play with <code>%splay &lt;number&gt;</code>", html.EscapeString(b.cfg.Matrix.CommandPrefix))
+	prefix := b.cfg.Matrix.CommandPrefix
+	fmt.Fprintf(&plain, "%splay <number> to play now, %squeue <number> to add to the queue", prefix, prefix)
+	fmt.Fprintf(&htmlOut, "<code>%splay &lt;number&gt;</code> to play now, <code>%squeue &lt;number&gt;</code> to add to the queue",
+		html.EscapeString(prefix), html.EscapeString(prefix))
 	b.reply(ctx, plain.String(), htmlOut.String())
 }
 

@@ -73,8 +73,9 @@ look it up via `/whoami` at startup.
 | --- | --- |
 | `!search [artist\|album\|track\|playlist] <query>` | search the library; results are numbered |
 | `!list` | show the last search results again |
-| `!play <n> [n ...]` | queue results by number |
-| `!play <query>` | search and queue the best match |
+| `!play <n> [n ...]` | play results by number **right away** |
+| `!play <query>` | search and play the best match right away |
+| `!queue <n> \| <query>` | add to the end of the queue instead |
 | `!queue` | show the queue |
 | `!nowplaying` | show the current track and elapsed time |
 | `!pause` / `!resume` | pause or resume |
@@ -83,7 +84,12 @@ look it up via `/whoami` at startup.
 | `!clear` | drop everything after the current track |
 | `!stop` | stop and empty the queue |
 
-Queuing an artist, album or playlist expands it into its tracks. Search results
+`!play` interrupts whatever is playing and starts the new selection at once. It
+does not throw away the queue: the new tracks are inserted after the current one,
+so anything already lined up still plays afterwards. Use `!queue` to add to the
+end without interrupting, and `!clear` or `!stop` to actually discard a queue.
+
+Playing an artist, album or playlist expands it into its tracks. Search results
 expire after `player.result_ttl`, so a stale number cannot play the wrong thing
 much later.
 

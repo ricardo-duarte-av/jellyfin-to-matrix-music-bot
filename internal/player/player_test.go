@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -231,6 +232,64 @@ func TestUnplayableTrackIsSkipped(t *testing.T) {
 	}
 	if got := pub.count(); got < 40 {
 		t.Errorf("published %d frames; want the queue to advance past the broken track", got)
+	}
+}
+
+// TestPlayNowInterruptsAndKeepsQueue pins down the difference between the two
+// commands: !play jumps straight to the new selection, while what was already
+// queued survives and plays afterwards.
+func TestPlayNowInterruptsAndKeepsQueue(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	tone := makeTone(t, dir, "tone.wav", 5, 440)
+	item := func(name string) jellyfin.Item {
+		return jellyfin.Item{ID: tone, Kind: jellyfin.KindTrack, Name: name}
+	}
+
+	p := newTestPlayer(t, &fakePublisher{})
+	p.Enqueue([]jellyfin.Item{item("A"), item("B")})
+	if current := p.Status().Current; current == nil || current.Name != "A" {
+		t.Fatalf("current = %v; want A", current)
+	}
+
+	added, truncated := p.PlayNow([]jellyfin.Item{item("X"), item("Y")})
+	if added != 2 || truncated {
+		t.Fatalf("PlayNow() = %d, %v; want 2, false", added, truncated)
+	}
+
+	status := p.Status()
+	if status.Current == nil || status.Current.Name != "X" {
+		t.Errorf("current = %v; want X to start immediately", status.Current)
+	}
+	if status.State != StatePlaying {
+		t.Errorf("state = %q; want %q", status.State, StatePlaying)
+	}
+
+	var names []string
+	for _, queued := range status.Queue {
+		names = append(names, queued.Name)
+	}
+	want := []string{"A", "X", "Y", "B"}
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("queue = %v; want %v — the new items go after the current track, and B is kept", names, want)
+	}
+}
+
+func TestPlayNowFromIdle(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	track := jellyfin.Item{ID: makeTone(t, dir, "tone.wav", 5, 440), Kind: jellyfin.KindTrack, Name: "Solo"}
+
+	p := newTestPlayer(t, &fakePublisher{})
+	if added, _ := p.PlayNow([]jellyfin.Item{track}); added != 1 {
+		t.Fatalf("PlayNow() added %d; want 1", added)
+	}
+	status := p.Status()
+	if status.Current == nil || status.Current.Name != "Solo" {
+		t.Errorf("current = %v; want Solo", status.Current)
+	}
+	if len(status.Queue) != 1 {
+		t.Errorf("queue length = %d; want 1", len(status.Queue))
 	}
 }
 

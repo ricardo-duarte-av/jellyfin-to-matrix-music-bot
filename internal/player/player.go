@@ -4,6 +4,7 @@ package player
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -146,6 +147,43 @@ func (p *Player) Enqueue(items []jellyfin.Item) (added int, truncated bool) {
 		if c.state == StateIdle && added > 0 {
 			c.startAt(p, c.position)
 		}
+	})
+	return added, truncated
+}
+
+// PlayNow starts playing items immediately, interrupting whatever is playing.
+//
+// The items are inserted directly after the current track rather than
+// replacing the queue, so anything already lined up still plays afterwards.
+// Use Stop or Clear to actually discard a queue.
+func (p *Player) PlayNow(items []jellyfin.Item) (added int, truncated bool) {
+	p.do(func(c *core) {
+		insertAt := c.position
+		if c.state != StateIdle {
+			insertAt++
+		}
+		if insertAt > len(c.queue) {
+			insertAt = len(c.queue)
+		}
+		if insertAt < 0 {
+			insertAt = 0
+		}
+
+		room := p.maxQueue - len(c.queue)
+		if room < len(items) {
+			truncated = true
+			if room < 0 {
+				room = 0
+			}
+			items = items[:room]
+		}
+		if len(items) == 0 {
+			return
+		}
+		added = len(items)
+
+		c.queue = slices.Insert(c.queue, insertAt, items...)
+		c.startAt(p, insertAt)
 	})
 	return added, truncated
 }
