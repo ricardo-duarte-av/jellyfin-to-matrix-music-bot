@@ -125,6 +125,26 @@ is `constrained` — so the number in the config is the number on the wire. Set
 `vbr: on` for slightly better quality if you would rather have the headroom
 spent on audio.
 
+## Album art
+
+Now-playing announcements are sent as the cover image with the track details as
+the caption, and the bot publishes that same cover as a still video track so it
+appears as a picture in the call instead of an empty tile. Both are on by
+default and can be turned off individually with `audio.album_art_chat` and
+`audio.album_art_video`.
+
+A still image needs exactly one keyframe: receivers hold the last decoded frame,
+so there is nothing to send between track changes. The track answers the SFU's
+PLI keyframe requests, which is how someone joining mid-song gets a picture,
+with a slow periodic re-send as a safety net. That works out at roughly 12KB per
+track change rather than a continuous video stream.
+
+Covers come from Jellyfin, falling back to the album's art for a track with no
+cover of its own, and to a generated tile carrying the track and artist names
+when there is no art at all. Chat uploads are cached per cover, so a 20-track
+album uploads its art once. None of this is load-bearing: if artwork fails at
+any point the bot carries on and simply announces tracks as text.
+
 ## Testing
 
 ```sh

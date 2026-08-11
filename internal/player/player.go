@@ -50,6 +50,8 @@ type Player struct {
 	// chat. It is buffered and drained by its own goroutine so that a slow
 	// homeserver can never stall the audio loop.
 	notices chan string
+	// changes carries track-change notifications to the TrackChanged callback.
+	changes chan *jellyfin.Item
 
 	cmds chan func(*core)
 	stop chan struct{}
@@ -68,35 +70,96 @@ type core struct {
 
 	stream  *stream
 	elapsed time.Duration
+	// announced is what the last track-change callback reported, so the run
+	// loop can emit one event per actual change.
+	announced string
 	// advance carries the reason the current track ended.
 	skipTo int
 }
 
-// New creates a player writing Opus to pub, encoded per encode. urlFor turns a
-// library item into a URL ffmpeg can read; notify receives playback events and
-// may be nil.
-func New(pub Publisher, ffmpegPath string, maxQueue int, encode EncodeOptions, urlFor func(jellyfin.Item) string, notify func(string)) *Player {
+// Options configures a Player.
+type Options struct {
+	// Publisher is the audio sink.
+	Publisher Publisher
+	// FFmpegPath is the ffmpeg binary to run.
+	FFmpegPath string
+	// MaxQueue caps the queue length.
+	MaxQueue int
+	// Encode controls the Opus encode.
+	Encode EncodeOptions
+	// URLFor turns a library item into a URL ffmpeg can read.
+	URLFor func(jellyfin.Item) string
+	// Notify receives human-readable playback events. Optional.
+	Notify func(string)
+	// TrackChanged is called with the new current track whenever playback
+	// moves, and with nil when playback stops. It gets the item rather than a
+	// formatted string so callers can use its artwork. Optional.
+	TrackChanged func(*jellyfin.Item)
+}
+
+// New creates a player from opts and starts its run loop.
+func New(opts Options) *Player {
 	p := &Player{
-		pub:        pub,
-		ffmpegPath: ffmpegPath,
-		maxQueue:   maxQueue,
-		encode:     encode,
-		urlFor:     urlFor,
+		pub:        opts.Publisher,
+		ffmpegPath: opts.FFmpegPath,
+		maxQueue:   opts.MaxQueue,
+		encode:     opts.Encode,
+		urlFor:     opts.URLFor,
 		notices:    make(chan string, 32),
+		changes:    make(chan *jellyfin.Item, 8),
 		cmds:       make(chan func(*core), 16),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
 		status:     Status{State: StateIdle},
 	}
 	go p.run()
+	// Both callbacks run on their own goroutines: they reach the network, and
+	// the run loop must never wait on the network.
 	go func() {
 		for msg := range p.notices {
-			if notify != nil {
-				notify(msg)
+			if opts.Notify != nil {
+				opts.Notify(msg)
+			}
+		}
+	}()
+	go func() {
+		for item := range p.changes {
+			if opts.TrackChanged != nil {
+				opts.TrackChanged(item)
 			}
 		}
 	}()
 	return p
+}
+
+// syncTrack emits a track-change event when the current track differs from the
+// last one reported. Doing it in one place in the run loop means every path
+// that changes tracks -- commands, the queue advancing, failures -- reports
+// consistently, rather than each having to remember to.
+func (p *Player) syncTrack(c *core) {
+	var item *jellyfin.Item
+	if c.state != StateIdle {
+		item = c.currentItem()
+	}
+	// Keyed by position too, so repeats of the same track still count.
+	key := ""
+	if item != nil {
+		key = fmt.Sprintf("%d:%s", c.position, item.ID)
+	}
+	if key == c.announced {
+		return
+	}
+	c.announced = key
+	p.announceTrack(item)
+}
+
+// announceTrack reports a track change. Unlike notices this must not be
+// dropped under load, or the artwork would stop matching what is playing.
+func (p *Player) announceTrack(item *jellyfin.Item) {
+	select {
+	case p.changes <- item:
+	case <-p.done:
+	}
 }
 
 // notify queues a chat notice. It never blocks: if the chat side has fallen
@@ -113,6 +176,7 @@ func (p *Player) Close() {
 	close(p.stop)
 	<-p.done
 	close(p.notices)
+	close(p.changes)
 }
 
 // Status returns the current playback status.
@@ -299,11 +363,13 @@ func (p *Player) run() {
 		case fn := <-p.cmds:
 			fn(c)
 			p.publishStatus(c)
+			p.syncTrack(c)
 		case <-ticker.C:
 			if c.state != StatePlaying || c.stream == nil {
 				continue
 			}
 			p.pump(c)
+			p.syncTrack(c)
 		}
 	}
 }
@@ -376,7 +442,9 @@ func (c *core) startAt(p *Player, idx int) {
 	c.state = StatePlaying
 }
 
-// stopPlayback tears down the current stream and returns to idle.
+// stopPlayback tears down the current stream and returns to idle. It does not
+// announce the change: callers either start another track straight away or
+// call announceIdle themselves.
 func (c *core) stopPlayback() {
 	if c.stream != nil {
 		c.stream.Close()

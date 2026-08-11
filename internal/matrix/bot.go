@@ -25,10 +25,40 @@ type Bot struct {
 	jf      *jellyfin.Client
 	player  *player.Player
 	results *results
-	roomID  id.RoomID
+	artwork *artworkCache
+	// art renders the in-call video tile; nil when video is not published.
+	art    ArtPublisher
+	roomID id.RoomID
 	// startedAt drops events from before the bot came up, so a restart does not
 	// replay old commands.
 	startedAt time.Time
+}
+
+// ArtPublisher shows an album cover on the bot's in-call video tile.
+type ArtPublisher interface {
+	// Show displays the artwork for item. A nil item means playback stopped.
+	Show(item *jellyfin.Item)
+}
+
+// artworkCacheSize caps how many cover uploads are remembered.
+const artworkCacheSize = 256
+
+// SetArtPublisher attaches the in-call video tile. Optional: without it the bot
+// is audio-only.
+func (b *Bot) SetArtPublisher(art ArtPublisher) { b.art = art }
+
+// TrackChanged is the player's track-change callback: it announces the track in
+// chat and updates the in-call artwork.
+func (b *Bot) TrackChanged(item *jellyfin.Item) {
+	if b.art != nil {
+		b.art.Show(item)
+	}
+	if item == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	b.sendNowPlaying(ctx, *item, "Now playing: "+item.Describe())
 }
 
 // New builds a bot. The player is supplied separately because it depends on the
@@ -40,6 +70,7 @@ func New(cfg *config.Config, client *mautrix.Client, jf *jellyfin.Client, plr *p
 		jf:        jf,
 		player:    plr,
 		results:   newResults(cfg.Player.ResultTTL),
+		artwork:   newArtworkCache(artworkCacheSize),
 		roomID:    id.RoomID(cfg.Matrix.RoomID),
 		startedAt: time.Now(),
 	}
@@ -123,15 +154,11 @@ func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 			b.reply(ctx, "Nothing is paused.", "")
 		}
 	case "next":
-		if b.player.Next() {
-			b.replyNowPlaying(ctx)
-		} else {
+		if !b.player.Next() {
 			b.reply(ctx, "Nothing left in the queue.", "")
 		}
 	case "prev":
-		if b.player.Prev() {
-			b.replyNowPlaying(ctx)
-		} else {
+		if !b.player.Prev() {
 			b.reply(ctx, "Already at the start of the queue.", "")
 		}
 	case "skip":
@@ -224,15 +251,19 @@ func (b *Bot) cmdPlay(ctx context.Context, cmd Command) {
 		return
 	}
 
+	// The track itself is announced by the player's track-change callback,
+	// with artwork; only mention what that message cannot convey.
 	added, truncated := b.player.PlayNow(tracks)
-	msg := "Now playing: " + tracks[0].Describe()
+	var extras []string
 	if added > 1 {
-		msg += fmt.Sprintf(" (+%d more)", added-1)
+		extras = append(extras, fmt.Sprintf("queued %d more after it", added-1))
 	}
 	if truncated {
-		msg += fmt.Sprintf(" Queue limit of %d reached.", b.cfg.Player.MaxQueue)
+		extras = append(extras, fmt.Sprintf("hit the queue limit of %d", b.cfg.Player.MaxQueue))
 	}
-	b.reply(ctx, msg, "")
+	if len(extras) > 0 {
+		b.reply(ctx, strings.ToUpper(extras[0][:1])+extras[0][1:]+joinRest(extras)+".", "")
+	}
 }
 
 // cmdQueue appends to the queue, or shows it when given no arguments.
@@ -320,12 +351,9 @@ func (b *Bot) cmdSkip(ctx context.Context, cmd Command) {
 		b.reply(ctx, "Usage: "+b.cfg.Matrix.CommandPrefix+"skip <queue position>", "")
 		return
 	}
-	item, err := b.player.SkipTo(indexes[0])
-	if err != nil {
+	if _, err := b.player.SkipTo(indexes[0]); err != nil {
 		b.reply(ctx, err.Error(), "")
-		return
 	}
-	b.reply(ctx, "Now playing: "+item.Describe(), "")
 }
 
 func (b *Bot) showQueue(ctx context.Context) {
@@ -364,7 +392,6 @@ func (b *Bot) replyNowPlaying(ctx context.Context) {
 		b.reply(ctx, "Nothing is playing.", "")
 		return
 	}
-	line := status.Current.Describe()
 	position := fmt.Sprintf(" [%s", jellyfin.FormatDuration(status.Elapsed))
 	if status.Current.Duration > 0 {
 		position += "/" + jellyfin.FormatDuration(status.Current.Duration)
@@ -375,7 +402,7 @@ func (b *Bot) replyNowPlaying(ctx context.Context) {
 	if status.State == player.StatePaused {
 		state = " (paused)"
 	}
-	b.reply(ctx, "Now playing: "+line+position+state, "")
+	b.sendNowPlaying(ctx, *status.Current, "Now playing: "+status.Current.Describe()+position+state)
 }
 
 func (b *Bot) replyResults(ctx context.Context, title string, items []jellyfin.Item) {
@@ -410,6 +437,14 @@ func (b *Bot) send(ctx context.Context, plain, htmlBody string) {
 	if _, err := b.client.SendMessageEvent(ctx, b.roomID, event.EventMessage, &content); err != nil {
 		b.client.Log.Err(err).Msg("failed to send message")
 	}
+}
+
+// joinRest renders any extras after the first as a trailing clause.
+func joinRest(extras []string) string {
+	if len(extras) < 2 {
+		return ""
+	}
+	return ", and " + strings.Join(extras[1:], ", ")
 }
 
 // bestMatch picks what a bare "!play <query>" should start. A track is the

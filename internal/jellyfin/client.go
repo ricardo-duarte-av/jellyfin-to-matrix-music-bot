@@ -5,13 +5,23 @@ package jellyfin
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	api "github.com/sj14/jellyfin-go/api"
 )
+
+// ErrNoArtwork means the item has no cover image.
+var ErrNoArtwork = errors.New("no artwork for this item")
+
+// maxArtworkBytes caps an artwork download. Covers are typically well under
+// this; anything larger is not worth holding in memory.
+const maxArtworkBytes = 8 << 20
 
 // Kind is the type of a library item the bot can show or play.
 type Kind string
@@ -62,6 +72,10 @@ type Item struct {
 	Artist   string
 	Album    string
 	Duration time.Duration
+	// ArtworkID is the item whose primary image represents this one: usually
+	// the item itself, or its album for a track with no cover of its own.
+	// Empty when there is no artwork at all.
+	ArtworkID string
 }
 
 // Describe renders the item for chat output.
@@ -104,6 +118,7 @@ func FormatDuration(d time.Duration) string {
 // Client talks to a Jellyfin server as a single API-key service account.
 type Client struct {
 	api    *api.APIClient
+	http   *http.Client
 	server string
 	apiKey string
 	userID string
@@ -117,6 +132,7 @@ func New(server, apiKey, userID string) *Client {
 	}
 	return &Client{
 		api:    api.NewAPIClient(cfg),
+		http:   &http.Client{Timeout: 30 * time.Second},
 		server: strings.TrimSuffix(server, "/"),
 		apiKey: apiKey,
 		userID: userID,
@@ -263,6 +279,48 @@ func (c *Client) StreamURL(trackID string) string {
 	return fmt.Sprintf("%s/Audio/%s/stream?%s", c.server, url.PathEscape(trackID), q.Encode())
 }
 
+// Artwork downloads an item's primary image, scaled to fit maxSize. It returns
+// the bytes and the content type. A track with no artwork returns ErrNoArtwork.
+func (c *Client) Artwork(ctx context.Context, item Item, maxSize int) ([]byte, string, error) {
+	if item.ArtworkID == "" {
+		return nil, "", ErrNoArtwork
+	}
+	url := fmt.Sprintf("%s/Items/%s/Images/Primary?maxWidth=%d&maxHeight=%d",
+		c.server, url.PathEscape(item.ArtworkID), maxSize, maxSize)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf(`MediaBrowser Token="%s"`, c.apiKey))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch artwork: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", ErrNoArtwork
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("fetch artwork: status %s", resp.Status)
+	}
+
+	// Cap the read: artwork is decoration, not worth unbounded memory.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxArtworkBytes))
+	if err != nil {
+		return nil, "", fmt.Errorf("read artwork: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, "", ErrNoArtwork
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	return data, contentType, nil
+}
+
 func audioItems(dtos []api.BaseItemDto) []Item {
 	out := make([]Item, 0, len(dtos))
 	for _, dto := range dtos {
@@ -288,6 +346,14 @@ func toItem(dto api.BaseItemDto, kind Kind) Item {
 	if ticks := dto.RunTimeTicks.Get(); ticks != nil && *ticks > 0 {
 		// Jellyfin ticks are 100ns units.
 		item.Duration = time.Duration(*ticks) * 100 * time.Nanosecond
+	}
+
+	// Prefer the item's own cover, then the album's. A track ripped without
+	// embedded art still shows the album cover this way.
+	if _, ok := dto.ImageTags["Primary"]; ok {
+		item.ArtworkID = item.ID
+	} else if albumID := str(dto.AlbumId.Get()); albumID != "" && str(dto.AlbumPrimaryImageTag.Get()) != "" {
+		item.ArtworkID = albumID
 	}
 	return item
 }

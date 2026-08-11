@@ -32,7 +32,14 @@ type Publisher struct {
 	room  *lksdk.Room
 	track *lksdk.LocalTrack
 	pub   *lksdk.LocalTrackPublication
+
+	video *videoTrack
 }
+
+// videoRefresh is the safety net for the still image: subscribers normally get
+// a keyframe on demand via PLI, so this only covers the case where a PLI is
+// lost or never sent.
+const videoRefresh = 10 * time.Second
 
 // Connect joins the LiveKit room described by cfg and publishes an audio track
 // that the player writes Opus frames into.
@@ -92,6 +99,44 @@ func (p *Publisher) WriteOpus(frame []byte) error {
 	return track.WriteSample(media.Sample{Data: frame, Duration: FrameDuration}, nil)
 }
 
+// PublishVideo adds a video track carrying a still image. It is optional: the
+// bot works as an audio-only participant if this fails or is never called.
+func (p *Publisher) PublishVideo(name string) error {
+	p.mu.Lock()
+	room := p.room
+	if room == nil {
+		p.mu.Unlock()
+		return fmt.Errorf("publisher is closed")
+	}
+	if p.video != nil {
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+
+	video, err := newVideoTrack(room, name)
+	if err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	p.video = video
+	p.mu.Unlock()
+	return nil
+}
+
+// ShowImage displays an H.264 keyframe on the video track. It is a no-op when no
+// video track has been published.
+func (p *Publisher) ShowImage(keyframe []byte) error {
+	p.mu.Lock()
+	video := p.video
+	p.mu.Unlock()
+	if video == nil {
+		return nil
+	}
+	return video.SetKeyframe(keyframe)
+}
+
 // Identity is the LiveKit participant identity in use.
 func (p *Publisher) Identity() string {
 	p.mu.Lock()
@@ -105,10 +150,13 @@ func (p *Publisher) Identity() string {
 // Close unpublishes the track and disconnects from the SFU.
 func (p *Publisher) Close() {
 	p.mu.Lock()
-	room, pub := p.room, p.pub
-	p.track, p.room, p.pub = nil, nil, nil
+	room, pub, video := p.room, p.pub, p.video
+	p.track, p.room, p.pub, p.video = nil, nil, nil, nil
 	p.mu.Unlock()
 
+	if video != nil {
+		video.Close(room)
+	}
 	if room != nil {
 		if pub != nil {
 			_ = room.LocalParticipant.UnpublishTrack(pub.SID())

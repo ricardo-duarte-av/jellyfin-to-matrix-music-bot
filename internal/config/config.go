@@ -39,7 +39,20 @@ type Audio struct {
 	// 0 disables FEC; 5-10 is a reasonable range for a lossy network. Higher
 	// values spend more of the bitrate on redundancy.
 	FECPacketLoss int `yaml:"fec_packet_loss"`
+	// AlbumArtVideo publishes the current cover as a still video track, so the
+	// bot shows a picture in the call rather than an empty tile. Costs about
+	// 12KB per track change plus an occasional keyframe refresh.
+	AlbumArtVideo *bool `yaml:"album_art_video"`
+	// AlbumArtChat sends now-playing announcements as the cover image with the
+	// track details as its caption.
+	AlbumArtChat *bool `yaml:"album_art_chat"`
 }
+
+// ShowArtVideo reports whether to publish the album-art video track.
+func (a Audio) ShowArtVideo() bool { return a.AlbumArtVideo == nil || *a.AlbumArtVideo }
+
+// ShowArtChat reports whether now-playing messages carry the cover image.
+func (a Audio) ShowArtChat() bool { return a.AlbumArtChat == nil || *a.AlbumArtChat }
 
 // IsStereo reports whether two channels are published.
 func (a Audio) IsStereo() bool { return a.Stereo == nil || *a.Stereo }

@@ -49,3 +49,10 @@ audio:
   # suits a lossy network, at the cost of some of the bitrate going to
   # redundancy rather than audio.
   fec_packet_loss: 0
+  # Publish the current album cover as a still video track, so the bot shows a
+  # picture in the call rather than an empty tile. Costs roughly 12KB per track
+  # change plus an occasional keyframe refresh.
+  album_art_video: true
+  # Send now-playing announcements as the cover image with the track details as
+  # the caption, rather than as plain text.
+  album_art_chat: true

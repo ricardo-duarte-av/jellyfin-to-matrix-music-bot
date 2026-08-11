@@ -63,7 +63,13 @@ func requireFFmpeg(t *testing.T) {
 
 func newTestPlayer(t *testing.T, pub Publisher) *Player {
 	t.Helper()
-	p := New(pub, "ffmpeg", 100, testEncode, func(item jellyfin.Item) string { return item.ID }, nil)
+	p := New(Options{
+		Publisher:  pub,
+		FFmpegPath: "ffmpeg",
+		MaxQueue:   100,
+		Encode:     testEncode,
+		URLFor:     func(item jellyfin.Item) string { return item.ID },
+	})
 	t.Cleanup(p.Close)
 	return p
 }
@@ -297,7 +303,13 @@ func TestPlayNowFromIdle(t *testing.T) {
 }
 
 func TestQueueLimit(t *testing.T) {
-	p := New(&fakePublisher{}, "ffmpeg", 2, testEncode, func(item jellyfin.Item) string { return "" }, nil)
+	p := New(Options{
+		Publisher:  &fakePublisher{},
+		FFmpegPath: "ffmpeg",
+		MaxQueue:   2,
+		Encode:     testEncode,
+		URLFor:     func(item jellyfin.Item) string { return "" },
+	})
 	defer p.Close()
 
 	// Every item here fails to open, which is fine: we only assert the limit.

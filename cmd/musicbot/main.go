@@ -15,6 +15,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/artwork"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/config"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/jellyfin"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/logging"
@@ -136,6 +137,20 @@ func run(configPath string) error {
 		Int("fec_packet_loss", cfg.Audio.FECPacketLoss).
 		Msg("connected to livekit and publishing")
 
+	// The album cover is published as a still video track, so the bot shows a
+	// picture in the call instead of an empty tile. It is decorative: if any
+	// of it fails the bot carries on as an audio-only participant.
+	var artPublisher *artwork.Publisher
+	if cfg.Audio.ShowArtVideo() {
+		if err := publisher.PublishVideo(cfg.RTC.DisplayName); err != nil {
+			client.Log.Warn().Err(err).Msg("could not publish album art video track; continuing audio-only")
+		} else {
+			artPublisher = artwork.NewPublisher(artwork.NewRenderer(cfg.Player.FFmpegPath), jf, publisher, log)
+			defer artPublisher.Close()
+			client.Log.Info().Msg("publishing album art as a video track")
+		}
+	}
+
 	// The bot and the player reference each other: the player reports track
 	// changes to chat, the bot drives the player. Build the player first with a
 	// notify hook that resolves once the bot exists.
@@ -146,16 +161,29 @@ func run(configPath string) error {
 		Channels:      cfg.Audio.Channels(),
 		FECPacketLoss: cfg.Audio.FECPacketLoss,
 	}
-	plr := player.New(publisher, cfg.Player.FFmpegPath, cfg.Player.MaxQueue, encode,
-		func(item jellyfin.Item) string { return jf.StreamURL(item.ID) },
-		func(msg string) {
+	plr := player.New(player.Options{
+		Publisher:  publisher,
+		FFmpegPath: cfg.Player.FFmpegPath,
+		MaxQueue:   cfg.Player.MaxQueue,
+		Encode:     encode,
+		URLFor:     func(item jellyfin.Item) string { return jf.StreamURL(item.ID) },
+		Notify: func(msg string) {
 			if bot != nil {
 				bot.Notify(msg)
 			}
-		})
+		},
+		TrackChanged: func(item *jellyfin.Item) {
+			if bot != nil {
+				bot.TrackChanged(item)
+			}
+		},
+	})
 	defer plr.Close()
 
 	bot = matrix.New(cfg, client, jf, plr)
+	if artPublisher != nil {
+		bot.SetArtPublisher(artPublisher)
+	}
 	client.Log.Info().Str("room", cfg.Matrix.RoomID).Msg("listening for commands")
 
 	if err := bot.Run(ctx); err != nil && ctx.Err() == nil {
