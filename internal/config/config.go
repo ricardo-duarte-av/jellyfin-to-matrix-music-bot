@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -19,6 +20,36 @@ type Config struct {
 	RTC      RTC      `yaml:"rtc"`
 	Jellyfin Jellyfin `yaml:"jellyfin"`
 	Player   Player   `yaml:"player"`
+	Audio    Audio    `yaml:"audio"`
+}
+
+// Audio controls how ffmpeg encodes Opus for the call.
+type Audio struct {
+	// Bitrate is the target, in ffmpeg syntax ("128k").
+	Bitrate string `yaml:"bitrate"`
+	// VBR is "constrained" (hold close to the target), "on" (free-running
+	// variable rate, which overshoots the target by roughly 15%), or "off"
+	// (constant rate).
+	VBR string `yaml:"vbr"`
+	// Stereo publishes two channels. Mono roughly halves the bitrate needed
+	// for the same perceived quality. It is a pointer so that an explicit
+	// "stereo: false" is distinguishable from the key being absent.
+	Stereo *bool `yaml:"stereo"`
+	// FECPacketLoss is the packet loss percentage to encode inband FEC for.
+	// 0 disables FEC; 5-10 is a reasonable range for a lossy network. Higher
+	// values spend more of the bitrate on redundancy.
+	FECPacketLoss int `yaml:"fec_packet_loss"`
+}
+
+// IsStereo reports whether two channels are published.
+func (a Audio) IsStereo() bool { return a.Stereo == nil || *a.Stereo }
+
+// Channels is the channel count implied by the stereo setting.
+func (a Audio) Channels() int {
+	if a.IsStereo() {
+		return 2
+	}
+	return 1
 }
 
 // Matrix holds homeserver connection details and the room the bot serves.
@@ -97,6 +128,14 @@ func (c *Config) applyDefaults() {
 	if c.Player.FFmpegPath == "" {
 		c.Player.FFmpegPath = "ffmpeg"
 	}
+	if c.Audio.Bitrate == "" {
+		c.Audio.Bitrate = "128k"
+	}
+	if c.Audio.VBR == "" {
+		// Constrained by default so the configured bitrate is the bitrate
+		// actually sent; free-running VBR overshoots it noticeably.
+		c.Audio.VBR = "constrained"
+	}
 	c.Matrix.Homeserver = strings.TrimSuffix(c.Matrix.Homeserver, "/")
 	c.Jellyfin.Server = strings.TrimSuffix(c.Jellyfin.Server, "/")
 	c.RTC.LiveKitServiceURL = strings.TrimSuffix(c.RTC.LiveKitServiceURL, "/")
@@ -137,8 +176,24 @@ func (c *Config) validate() error {
 			return fmt.Errorf("matrix.admins[%d] must start with '@', got %q", i, admin)
 		}
 	}
+
+	switch c.Audio.VBR {
+	case "on", "constrained", "off":
+	default:
+		return fmt.Errorf("audio.vbr must be on, constrained or off, got %q", c.Audio.VBR)
+	}
+	if c.Audio.FECPacketLoss < 0 || c.Audio.FECPacketLoss > 100 {
+		return fmt.Errorf("audio.fec_packet_loss must be a percentage between 0 and 100, got %d", c.Audio.FECPacketLoss)
+	}
+	if !bitratePattern.MatchString(c.Audio.Bitrate) {
+		return fmt.Errorf("audio.bitrate must look like 128k or 96000, got %q", c.Audio.Bitrate)
+	}
 	return nil
 }
+
+// bitratePattern accepts ffmpeg's bitrate syntax: a number, optionally with a
+// k or M suffix.
+var bitratePattern = regexp.MustCompile(`^[0-9]+[kKmM]?$`)
 
 // IsAdmin reports whether userID may run control commands. An empty admin list
 // means everyone is allowed.

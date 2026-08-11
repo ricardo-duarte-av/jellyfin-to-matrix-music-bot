@@ -12,10 +12,9 @@ import (
 )
 
 const (
-	// SampleRate and Channels are what we ask ffmpeg to encode Opus at. 48kHz
-	// stereo is Opus's native mode and what every WebRTC client expects.
+	// SampleRate is what we ask ffmpeg to encode Opus at. 48kHz is Opus's
+	// native rate and what every WebRTC client expects.
 	SampleRate = 48000
-	Channels   = 2
 
 	// FrameDuration is the Opus frame size the bot publishes. ffmpeg is told to
 	// use the same value so one Ogg packet is one RTP sample.
@@ -37,18 +36,29 @@ type Publisher struct {
 
 // Connect joins the LiveKit room described by cfg and publishes an audio track
 // that the player writes Opus frames into.
-func Connect(cfg *SFUConfig, displayName string) (*Publisher, error) {
+//
+// channels must match what the encoder produces. It is negotiated in three
+// places that have to agree, or listeners get a downmix: the RTP codec
+// parameters, the SDP fmtp offered to subscribers, and the AddTrackRequest the
+// SFU uses when describing the track onwards.
+func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, error) {
 	room, err := lksdk.ConnectToRoomWithToken(cfg.URL, cfg.JWT, &lksdk.RoomCallback{},
 		lksdk.WithAutoSubscribe(false))
 	if err != nil {
 		return nil, fmt.Errorf("connect to livekit at %s: %w", cfg.URL, err)
 	}
 
+	stereo := channels == 2
+	fmtp := "minptime=10;useinbandfec=1"
+	if stereo {
+		fmtp += ";stereo=1;sprop-stereo=1"
+	}
+
 	track, err := lksdk.NewLocalSampleTrack(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeOpus,
 		ClockRate:   SampleRate,
-		Channels:    Channels,
-		SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
+		Channels:    uint16(channels),
+		SDPFmtpLine: fmtp,
 	})
 	if err != nil {
 		room.Disconnect()
@@ -58,7 +68,9 @@ func Connect(cfg *SFUConfig, displayName string) (*Publisher, error) {
 	pub, err := room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
 		Name:   displayName,
 		Source: livekit.TrackSource_MICROPHONE,
-		Stereo: true,
+		Stereo: stereo,
+		// The encoder never emits DTX, so do not let the SFU advertise it.
+		DisableDTX: true,
 	})
 	if err != nil {
 		room.Disconnect()

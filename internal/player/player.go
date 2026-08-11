@@ -42,6 +42,7 @@ type Player struct {
 	pub        Publisher
 	ffmpegPath string
 	maxQueue   int
+	encode     EncodeOptions
 	// urlFor resolves a library item to something ffmpeg can read.
 	urlFor func(jellyfin.Item) string
 
@@ -71,13 +72,15 @@ type core struct {
 	skipTo int
 }
 
-// New creates a player writing Opus to pub. urlFor turns a library item into a
-// URL ffmpeg can read; notify receives playback events and may be nil.
-func New(pub Publisher, ffmpegPath string, maxQueue int, urlFor func(jellyfin.Item) string, notify func(string)) *Player {
+// New creates a player writing Opus to pub, encoded per encode. urlFor turns a
+// library item into a URL ffmpeg can read; notify receives playback events and
+// may be nil.
+func New(pub Publisher, ffmpegPath string, maxQueue int, encode EncodeOptions, urlFor func(jellyfin.Item) string, notify func(string)) *Player {
 	p := &Player{
 		pub:        pub,
 		ffmpegPath: ffmpegPath,
 		maxQueue:   maxQueue,
+		encode:     encode,
 		urlFor:     urlFor,
 		notices:    make(chan string, 32),
 		cmds:       make(chan func(*core), 16),
@@ -357,7 +360,7 @@ func (c *core) startAt(p *Player, idx int) {
 	c.position = idx
 	item := c.queue[idx]
 
-	s, err := openStream(p.ffmpegPath, p.urlFor(item))
+	s, err := openStream(p.ffmpegPath, p.urlFor(item), p.encode)
 	if err != nil {
 		p.notify(fmt.Sprintf("Could not play %s: %v", item.Describe(), err))
 		// Move past the broken track rather than wedging the queue.

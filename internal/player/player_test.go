@@ -51,6 +51,9 @@ func makeTone(t *testing.T, dir, name string, seconds int, freq int) string {
 	return path
 }
 
+// testEncode mirrors the shipped defaults.
+var testEncode = EncodeOptions{Bitrate: "128k", VBR: "constrained", Channels: 2}
+
 func requireFFmpeg(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
@@ -60,7 +63,7 @@ func requireFFmpeg(t *testing.T) {
 
 func newTestPlayer(t *testing.T, pub Publisher) *Player {
 	t.Helper()
-	p := New(pub, "ffmpeg", 100, func(item jellyfin.Item) string { return item.ID }, nil)
+	p := New(pub, "ffmpeg", 100, testEncode, func(item jellyfin.Item) string { return item.ID }, nil)
 	t.Cleanup(p.Close)
 	return p
 }
@@ -294,7 +297,7 @@ func TestPlayNowFromIdle(t *testing.T) {
 }
 
 func TestQueueLimit(t *testing.T) {
-	p := New(&fakePublisher{}, "ffmpeg", 2, func(item jellyfin.Item) string { return "" }, nil)
+	p := New(&fakePublisher{}, "ffmpeg", 2, testEncode, func(item jellyfin.Item) string { return "" }, nil)
 	defer p.Close()
 
 	// Every item here fails to open, which is fine: we only assert the limit.

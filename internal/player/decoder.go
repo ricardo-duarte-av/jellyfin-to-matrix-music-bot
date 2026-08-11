@@ -45,11 +45,26 @@ type stream struct {
 	stderr  *strings.Builder
 }
 
-// openStream starts ffmpeg on url and begins producing Opus frames.
+// EncodeOptions controls the Opus encode. Because the bot publishes a fixed
+// rate and ignores congestion feedback, whatever is set here is what goes on
+// the wire for every listener.
+type EncodeOptions struct {
+	// Bitrate is the target in ffmpeg syntax, e.g. "128k".
+	Bitrate string
+	// VBR is "on", "constrained" or "off".
+	VBR string
+	// Channels is 1 or 2.
+	Channels int
+	// FECPacketLoss, when above zero, turns on inband FEC tuned for that
+	// packet loss percentage.
+	FECPacketLoss int
+}
+
+// ffmpegArgs builds the encoder command line for url.
 //
 // ffmpeg is asked for one Opus packet per Ogg page (-page_duration 20000), so
 // every page maps to exactly one RTP sample and no repacketization is needed.
-func openStream(ffmpegPath, url string) (*stream, error) {
+func (o EncodeOptions) ffmpegArgs(url string) []string {
 	args := []string{
 		"-nostdin",
 		"-hide_banner",
@@ -69,15 +84,27 @@ func openStream(ffmpegPath, url string) (*stream, error) {
 		"-vn",
 		"-map", "a:0",
 		"-c:a", "libopus",
-		"-b:a", "128k",
+		"-b:a", o.Bitrate,
+		"-vbr", o.VBR,
 		"-ar", fmt.Sprint(rtc.SampleRate),
-		"-ac", fmt.Sprint(rtc.Channels),
+		"-ac", fmt.Sprint(o.Channels),
 		"-frame_duration", "20",
+		// "audio" rather than "voip": no speech-tuned processing.
 		"-application", "audio",
+	)
+	if o.FECPacketLoss > 0 {
+		args = append(args, "-packet_loss", fmt.Sprint(o.FECPacketLoss))
+	}
+	return append(args,
 		"-f", "ogg",
 		"-page_duration", "20000",
 		"-",
 	)
+}
+
+// openStream starts ffmpeg on url and begins producing Opus frames.
+func openStream(ffmpegPath, url string, opts EncodeOptions) (*stream, error) {
+	args := opts.ffmpegArgs(url)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, ffmpegPath, args...)

@@ -30,3 +30,22 @@ player:
   result_ttl: 10m
   max_queue: 200
   ffmpeg_path: ffmpeg
+
+audio:
+  # Target bitrate for the Opus encode. The bot sends this rate constantly to
+  # the SFU and never adapts to congestion feedback, so it is what every
+  # listener receives.
+  bitrate: 128k
+  # constrained = stay close to the target bitrate (what you set is what is
+  #               sent)
+  # on          = free-running VBR, better quality but overshoots the target
+  #               by roughly 15% (128k measured at ~148 kbps)
+  # off         = constant bitrate
+  vbr: constrained
+  # Two channels. Mono needs roughly half the bitrate for the same perceived
+  # quality, which is worth considering if bandwidth matters more than imaging.
+  stereo: true
+  # Encode inband FEC for this packet-loss percentage. 0 disables it; 5-10
+  # suits a lossy network, at the cost of some of the bitrate going to
+  # redundancy rather than audio.
+  fec_packet_loss: 0

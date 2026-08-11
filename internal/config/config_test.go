@@ -102,6 +102,63 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestAudioDefaults(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Audio.Bitrate != "128k" {
+		t.Errorf("Bitrate = %q; want 128k", cfg.Audio.Bitrate)
+	}
+	// Constrained by default so the configured number is the number sent.
+	if cfg.Audio.VBR != "constrained" {
+		t.Errorf("VBR = %q; want constrained", cfg.Audio.VBR)
+	}
+	if !cfg.Audio.IsStereo() || cfg.Audio.Channels() != 2 {
+		t.Errorf("stereo default = %v (%d channels); want stereo", cfg.Audio.IsStereo(), cfg.Audio.Channels())
+	}
+	if cfg.Audio.FECPacketLoss != 0 {
+		t.Errorf("FECPacketLoss = %d; want 0", cfg.Audio.FECPacketLoss)
+	}
+}
+
+// An explicit "stereo: false" must be honoured, which is why the field is a
+// pointer: a plain bool cannot tell it apart from the key being absent.
+func TestAudioStereoCanBeDisabled(t *testing.T) {
+	cfg, err := Load(write(t, validConfig+"\naudio:\n  stereo: false\n"))
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Audio.IsStereo() {
+		t.Error("IsStereo() = true after an explicit stereo: false")
+	}
+	if got := cfg.Audio.Channels(); got != 1 {
+		t.Errorf("Channels() = %d; want 1", got)
+	}
+}
+
+func TestAudioValidation(t *testing.T) {
+	tests := map[string]string{
+		"bad vbr mode":     "\naudio:\n  vbr: sometimes\n",
+		"bad bitrate":      "\naudio:\n  bitrate: loud\n",
+		"fec out of range": "\naudio:\n  fec_packet_loss: 150\n",
+		"negative fec":     "\naudio:\n  fec_packet_loss: -1\n",
+	}
+	for name, extra := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(t, validConfig+extra)); err == nil {
+				t.Errorf("Load() accepted %s; want an error", name)
+			}
+		})
+	}
+
+	for _, ok := range []string{"128k", "96000", "1M"} {
+		if _, err := Load(write(t, validConfig+"\naudio:\n  bitrate: "+ok+"\n")); err != nil {
+			t.Errorf("Load() rejected valid bitrate %q: %v", ok, err)
+		}
+	}
+}
+
 func TestIsAdmin(t *testing.T) {
 	cfg := &Config{Matrix: Matrix{Admins: []string{"@me:example.org"}}}
 	if !cfg.IsAdmin("@me:example.org") {

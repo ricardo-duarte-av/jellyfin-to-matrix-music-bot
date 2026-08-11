@@ -96,6 +96,35 @@ much later.
 `!stop`, `!clear` and `!skip` are limited to `matrix.admins`. Leave that list
 empty to let everyone use them.
 
+## Audio quality
+
+The bot publishes a **constant** bitrate and ignores WebRTC congestion feedback
+entirely — nothing in the call negotiates the rate downwards, so whatever is
+configured is what every listener receives. Budget accordingly.
+
+Defaults: **128 kbps, stereo, constrained VBR, no FEC**, encoded by ffmpeg with
+`-application audio` (no speech-tuned processing).
+
+Stereo has to be agreed in three places or listeners get a downmix, and the bot
+sets all three from `audio.stereo`: the RTP codec parameters, the `stereo=1;
+sprop-stereo=1` fmtp offered to subscribers, and the `Stereo` flag in the
+AddTrackRequest that tells the SFU how to describe the track onwards.
+
+Measured payload rates on a real FLAC source (30s, excluding Ogg overhead):
+
+| `bitrate` | `vbr` | actual payload |
+| --- | --- | --- |
+| 96k | on | 112 kbps |
+| 128k | on | 148 kbps |
+| 160k | on | 184 kbps |
+| 192k | on | 216 kbps |
+| 128k | constrained | **128 kbps** |
+
+Free-running VBR overshoots its target by roughly 15%, which is why the default
+is `constrained` — so the number in the config is the number on the wire. Set
+`vbr: on` for slightly better quality if you would rather have the headroom
+spent on audio.
+
 ## Testing
 
 ```sh

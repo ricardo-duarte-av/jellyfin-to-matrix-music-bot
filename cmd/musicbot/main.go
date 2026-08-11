@@ -123,18 +123,30 @@ func run(configPath string) error {
 		}
 	}()
 
-	publisher, err := rtc.Connect(sfu, cfg.RTC.DisplayName)
+	publisher, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
 	if err != nil {
 		return err
 	}
 	defer publisher.Close()
-	client.Log.Info().Str("identity", publisher.Identity()).Msg("connected to livekit and publishing")
+	client.Log.Info().
+		Str("identity", publisher.Identity()).
+		Str("bitrate", cfg.Audio.Bitrate).
+		Str("vbr", cfg.Audio.VBR).
+		Int("channels", cfg.Audio.Channels()).
+		Int("fec_packet_loss", cfg.Audio.FECPacketLoss).
+		Msg("connected to livekit and publishing")
 
 	// The bot and the player reference each other: the player reports track
 	// changes to chat, the bot drives the player. Build the player first with a
 	// notify hook that resolves once the bot exists.
 	var bot *matrix.Bot
-	plr := player.New(publisher, cfg.Player.FFmpegPath, cfg.Player.MaxQueue,
+	encode := player.EncodeOptions{
+		Bitrate:       cfg.Audio.Bitrate,
+		VBR:           cfg.Audio.VBR,
+		Channels:      cfg.Audio.Channels(),
+		FECPacketLoss: cfg.Audio.FECPacketLoss,
+	}
+	plr := player.New(publisher, cfg.Player.FFmpegPath, cfg.Player.MaxQueue, encode,
 		func(item jellyfin.Item) string { return jf.StreamURL(item.ID) },
 		func(msg string) {
 			if bot != nil {
