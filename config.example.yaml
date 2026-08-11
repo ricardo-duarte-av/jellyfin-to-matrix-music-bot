@@ -1,0 +1,32 @@
+matrix:
+  homeserver: https://matrix.example.org
+  user_id: "@musicbot:example.org"
+  access_token: "syt_..."
+  device_id: "MUSICBOT"
+  # The room the bot listens in and streams into. It MUST be unencrypted:
+  # Element Call only runs the call without media E2EE in unencrypted rooms,
+  # and this bot publishes plain Opus.
+  room_id: "!streaming:example.org"
+  # Users allowed to run control commands (!stop, !clear, !skip).
+  # Leave empty to let everyone control the bot.
+  admins:
+    - "@you:example.org"
+  command_prefix: "!"
+
+rtc:
+  # Optional. Leave empty to discover the MatrixRTC authorization service from
+  # the homeserver's /.well-known/matrix/client (org.matrix.msc4143.rtc_foci).
+  livekit_service_url: ""
+  display_name: "Jukebox"
+
+jellyfin:
+  server: http://jellyfin.local:8096
+  api_key: "..."
+  # Jellyfin user whose library view and playlists the bot uses.
+  user_id: "..."
+
+player:
+  search_limit: 10
+  result_ttl: 10m
+  max_queue: 200
+  ffmpeg_path: ffmpeg
