@@ -11,11 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	lksdk "github.com/livekit/server-sdk-go/v2"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/config"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/jellyfin"
+	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/logging"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/matrix"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/player"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/rtc"
@@ -41,10 +43,19 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	log, err := logging.New(cfg.LogLevel)
+	if err != nil {
+		return err
+	}
+	// The LiveKit SDK and pion log through their own global logger; route it
+	// into ours so everything lands in one stream at a sane volume.
+	lksdk.SetLogger(logging.LiveKit(log, cfg.LogLevel == "debug"))
+
 	client, err := mautrix.NewClient(cfg.Matrix.Homeserver, id.UserID(cfg.Matrix.UserID), cfg.Matrix.AccessToken)
 	if err != nil {
 		return fmt.Errorf("create matrix client: %w", err)
 	}
+	client.Log = log
 
 	// The device ID must match the one the access token belongs to: it is half
 	// of the LiveKit identity the JWT service derives.

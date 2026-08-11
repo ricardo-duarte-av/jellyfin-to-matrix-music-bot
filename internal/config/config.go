@@ -12,6 +12,9 @@ import (
 
 // Config is the root of config.yaml.
 type Config struct {
+	// LogLevel is one of debug, info, warn, error. debug also un-mutes the
+	// LiveKit and pion logging, which is very verbose.
+	LogLevel string   `yaml:"log_level"`
 	Matrix   Matrix   `yaml:"matrix"`
 	RTC      RTC      `yaml:"rtc"`
 	Jellyfin Jellyfin `yaml:"jellyfin"`
@@ -73,6 +76,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
 	if c.Matrix.CommandPrefix == "" {
 		c.Matrix.CommandPrefix = "!"
 	}
