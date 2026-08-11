@@ -123,16 +123,61 @@ func New(server, apiKey, userID string) *Client {
 	}
 }
 
-// Ping verifies the server is reachable and the credentials work.
+// Ping verifies the server is reachable and the credentials work. It also
+// resolves jellyfin.user_id if it was given as a username rather than an ID.
 func (c *Client) Ping(ctx context.Context) error {
 	_, _, err := c.api.SystemAPI.GetPublicSystemInfo(ctx).Execute()
 	if err != nil {
 		return fmt.Errorf("jellyfin unreachable: %w", err)
 	}
+	if err := c.resolveUser(ctx); err != nil {
+		return err
+	}
 	if _, _, err := c.api.ItemsAPI.GetItems(ctx).UserId(c.userID).Limit(1).Execute(); err != nil {
 		return fmt.Errorf("jellyfin credentials or user_id rejected: %w", err)
 	}
 	return nil
+}
+
+// UserID is the resolved Jellyfin user ID in use.
+func (c *Client) UserID() string { return c.userID }
+
+// resolveUser turns a configured username into its user ID. Jellyfin's item
+// APIs only accept IDs, but a username is the obvious thing to put in a config
+// file, so accept either.
+func (c *Client) resolveUser(ctx context.Context) error {
+	if isUserID(c.userID) {
+		return nil
+	}
+	users, _, err := c.api.UserAPI.GetUsers(ctx).Execute()
+	if err != nil {
+		return fmt.Errorf("look up jellyfin user %q: %w", c.userID, err)
+	}
+	var names []string
+	for _, user := range users {
+		name := str(user.Name.Get())
+		names = append(names, name)
+		if strings.EqualFold(name, c.userID) && user.Id != nil {
+			c.userID = *user.Id
+			return nil
+		}
+	}
+	return fmt.Errorf("no jellyfin user named %q; known users: %s", c.userID, strings.Join(names, ", "))
+}
+
+// isUserID reports whether s looks like a Jellyfin user ID: a UUID with the
+// dashes stripped, as Jellyfin renders them.
+func isUserID(s string) bool {
+	s = strings.ReplaceAll(s, "-", "")
+	if len(s) != 32 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // Search returns up to limit items of each requested kind matching term.
