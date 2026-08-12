@@ -43,3 +43,29 @@ func TestCallMemberEventTypeMatchesStateMapKey(t *testing.T) {
 		t.Error("lookup with CallMemberEventType missed a state map keyed as mautrix keys it")
 	}
 }
+
+// Ejecting someone means retracting every membership they hold, so the key
+// formats in the wild all have to be recognised — without one user's ID
+// swallowing another whose ID starts the same way.
+func TestMembershipBelongsTo(t *testing.T) {
+	const bob = "@bob:example.org"
+	for _, key := range []string{
+		"_@bob:example.org_DEVICE",
+		"@bob:example.org_DEVICE",
+		"@bob:example.org",
+	} {
+		if !MembershipBelongsTo(key, bob) {
+			t.Errorf("MembershipBelongsTo(%q, %s) = false; want true", key, bob)
+		}
+	}
+	for _, key := range []string{
+		"_@bobby:example.org_DEVICE",
+		"@bobby:example.org",
+		"_@alice:example.org_DEVICE",
+		"",
+	} {
+		if MembershipBelongsTo(key, bob) {
+			t.Errorf("MembershipBelongsTo(%q, %s) = true; want false", key, bob)
+		}
+	}
+}

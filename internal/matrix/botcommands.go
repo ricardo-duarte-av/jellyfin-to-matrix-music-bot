@@ -151,6 +151,14 @@ func commandSpecs() []commandSpec {
 		{Command: "next", Description: describe("Skip to the next track")},
 		{Command: "prev", Description: describe("Go back to the previous track")},
 		{Command: "clear", Description: describe("Drop everything after the current track")},
+		{
+			Command:     "eject",
+			Description: describe("Remove someone from the call"),
+			Parameters: []paramSpec{
+				{Key: "user_id", Schema: primitive("user_id"),
+					Description: describe("Who to remove; they can rejoin")},
+			},
+		},
 		{Command: "stop", Description: describe("Stop playing and empty the queue")},
 		{Command: "help", Description: describe("List the commands")},
 	}

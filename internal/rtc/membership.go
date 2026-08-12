@@ -91,6 +91,19 @@ func NewMembership(client *mautrix.Client, roomID id.RoomID, userID id.UserID, d
 // StateKey is the state key the bot's membership lives under.
 func (m *Membership) StateKey() string { return m.stateKey }
 
+// MembershipBelongsTo reports whether a membership state key is one of user's.
+//
+// Three key formats are in the wild: Element Call's "_<user>_<device>", the
+// same without the leading underscore, and the original MSC3401 form of a bare
+// user ID. Matching on the separator rather than a substring keeps "@bob:x"
+// from claiming "@bobby:x"'s membership.
+func MembershipBelongsTo(stateKey string, user id.UserID) bool {
+	owner := user.String()
+	return stateKey == owner ||
+		strings.HasPrefix(stateKey, "_"+owner+"_") ||
+		strings.HasPrefix(stateKey, owner+"_")
+}
+
 // MembershipID is the LiveKit identity implied by this membership.
 func (m *Membership) MembershipID() string {
 	return fmt.Sprintf("%s:%s", m.userID, m.deviceID)

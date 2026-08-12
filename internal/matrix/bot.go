@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/config"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/jellyfin"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/player"
+	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/rtc"
 )
 
 // Bot wires chat commands to the Jellyfin library and the player.
@@ -165,6 +167,7 @@ var controlCommands = map[string]bool{
 	"stop":  true,
 	"clear": true,
 	"skip":  true,
+	"eject": true,
 }
 
 func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
@@ -216,6 +219,8 @@ func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 	case "clear":
 		removed := b.player.Clear()
 		b.reply(ctx, fmt.Sprintf("Cleared %d queued track(s).", removed), "")
+	case "eject":
+		b.cmdEject(ctx, cmd)
 	case "stop":
 		b.player.Stop()
 		b.reply(ctx, "Stopped and cleared the queue.", "")
@@ -241,6 +246,7 @@ func (b *Bot) cmdHelp(ctx context.Context) {
 		{p + "repeat on|off", "loop the queue when it ends"},
 		{p + "clear", "drop everything after the current track"},
 		{p + "stop", "stop playing and empty the queue"},
+		{p + "eject <@user:server>", "remove someone from the call (they can rejoin)"},
 	}
 
 	var plain, htmlOut strings.Builder
@@ -345,6 +351,85 @@ func (b *Bot) cmdQueue(ctx context.Context, cmd Command) {
 		}
 	}
 	b.reply(ctx, msg, "")
+}
+
+// cmdEject removes someone from the call by retracting their MatrixRTC
+// membership.
+//
+// MatrixRTC has no way to mute another participant: membership state is the
+// only lever a third party has, and the media backend takes its instructions
+// from the SFU token, which is scoped to the bot itself. Retracting the
+// membership is therefore an eject, not a mute, and nothing stops the ejected
+// client from publishing a fresh membership and coming straight back.
+func (b *Bot) cmdEject(ctx context.Context, cmd Command) {
+	target, ok := parseUserID(cmd.Rest)
+	if !ok {
+		b.reply(ctx, "Usage: "+b.cfg.Matrix.CommandPrefix+"eject @user:server", "")
+		return
+	}
+	if target == b.client.UserID {
+		b.reply(ctx, "That is me. Use "+b.cfg.Matrix.CommandPrefix+"stop to end playback.", "")
+		return
+	}
+
+	state, err := b.client.State(ctx, b.roomID)
+	if err != nil {
+		b.reply(ctx, "Could not read the call state: "+err.Error(), "")
+		return
+	}
+
+	// One person can be in the call from several devices, each with its own
+	// membership, so every one of them has to go.
+	var failed error
+	ejected := 0
+	for stateKey, evt := range state[callMemberEventType] {
+		if evt == nil || !rtc.MembershipBelongsTo(stateKey, target) {
+			continue
+		}
+		// An already-retracted membership is someone who has left.
+		if isEmptyMembership(evt) {
+			continue
+		}
+		if _, err := b.client.RedactEvent(ctx, b.roomID, evt.ID); err != nil {
+			failed = err
+			continue
+		}
+		ejected++
+	}
+
+	name := b.displayName(ctx, target)
+	switch {
+	case failed != nil && ejected == 0:
+		b.reply(ctx, "Could not eject "+name+": "+failed.Error(), "")
+	case ejected == 0:
+		b.reply(ctx, name+" is not in the call.", "")
+	default:
+		plain := fmt.Sprintf("Ejected %s from the call (%d device(s)). They can rejoin.", name, ejected)
+		formatted := fmt.Sprintf("Ejected %s from the call (%d device(s)). They can rejoin.",
+			userPill(target, name), ejected)
+		b.reply(ctx, plain, formatted)
+	}
+}
+
+// parseUserID reads a user ID, accepting the matrix.to link a client pastes
+// when you pick someone out of the room.
+func parseUserID(arg string) (id.UserID, bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", false
+	}
+	if idx := strings.LastIndex(arg, "matrix.to/#/"); idx >= 0 {
+		arg = arg[idx+len("matrix.to/#/"):]
+		if unescaped, err := url.PathUnescape(arg); err == nil {
+			arg = unescaped
+		}
+		arg, _, _ = strings.Cut(arg, "?")
+	}
+	user := id.UserID(arg)
+	if _, _, err := user.Parse(); err != nil {
+		return "", false
+	}
+	return user, true
 }
 
 // resolveTracks turns "<number> [number ...]" or "<query>" into playable

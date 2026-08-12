@@ -129,6 +129,7 @@ musicbot -check   # or against a local build
 | `!repeat on\|off` | loop the queue when it ends |
 | `!clear` | drop everything after the current track |
 | `!stop` | stop and empty the queue |
+| `!eject <@user:server>` | remove someone from the call |
 
 `!play` interrupts whatever is playing and starts the new selection at once. It
 does not throw away the queue: the new tracks are inserted after the current one,
@@ -164,8 +165,23 @@ that no longer exist are retracted at startup, since the state key hashes the
 command name and a rename would otherwise leave clients offering a command that
 no longer answers.
 
-`!stop`, `!clear` and `!skip` are limited to `matrix.admins`. Leave that list
-empty to let everyone use them.
+`!stop`, `!clear`, `!skip` and `!eject` are limited to `matrix.admins`. Leave
+that list empty to let everyone use them.
+
+### Ejecting someone from the call
+
+`!eject` retracts a participant's MatrixRTC membership, which their client reads
+as having been removed from the call. It is not a mute: MatrixRTC has no way for
+one participant to silence another, and the SFU token the bot is issued grants
+only `RoomJoin`, `CanPublish`, `CanSubscribe` and `CanUpdateOwnMetadata` — no
+`RoomAdmin`, so LiveKit's server-side mute is out of reach. Nothing stops an
+ejected client from publishing a fresh membership and rejoining; to keep someone
+out, raise the power level required for `org.matrix.msc3401.call.member` or
+remove them from the room.
+
+Someone in the call from several devices holds one membership per device, and
+all of them are retracted. The bot needs enough power to redact other people's
+events, which is power level 50 by default.
 
 The bot also announces people joining and leaving the call, with their name as a
 pill. Participants already present when it starts are not announced, and someone

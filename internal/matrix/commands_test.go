@@ -385,7 +385,7 @@ func TestAdvertisedCommandsAreHandled(t *testing.T) {
 		"help": true, "search": true, "list": true, "play": true, "queue": true,
 		"nowplaying": true, "pause": true, "resume": true, "next": true,
 		"prev": true, "skip": true, "random": true, "repeat": true,
-		"clear": true, "stop": true,
+		"clear": true, "stop": true, "eject": true,
 	}
 	for _, spec := range commandSpecs() {
 		if !handled[spec.Command] {
@@ -470,6 +470,26 @@ func TestUnchangedDescriptionSkipsRewrites(t *testing.T) {
 	} {
 		if unchangedDescription(missing, spec) {
 			t.Error("missing or retracted description reported as unchanged; it would never be published")
+		}
+	}
+}
+
+func TestParseUserID(t *testing.T) {
+	for _, arg := range []string{
+		"@bob:example.org",
+		"  @bob:example.org  ",
+		"https://matrix.to/#/@bob:example.org",
+		"https://matrix.to/#/%40bob%3Aexample.org",
+		"https://matrix.to/#/@bob:example.org?via=example.org",
+	} {
+		got, ok := parseUserID(arg)
+		if !ok || got != "@bob:example.org" {
+			t.Errorf("parseUserID(%q) = %q, %v; want @bob:example.org, true", arg, got, ok)
+		}
+	}
+	for _, arg := range []string{"", "   ", "bob", "#room:example.org", "!room:example.org"} {
+		if got, ok := parseUserID(arg); ok {
+			t.Errorf("parseUserID(%q) = %q; want not ok", arg, got)
 		}
 	}
 }
