@@ -1,0 +1,38 @@
+services:
+  musicbot:
+    image: ghcr.io/ricardo-duarte-av/jellyfin-to-matrix-music-bot:latest
+    # To run your own build instead of the published image, comment out `image`
+    # above and uncomment this:
+    # build: .
+    container_name: musicbot
+    restart: unless-stopped
+
+    volumes:
+      # The config carries a Matrix access token and a Jellyfin API key, so it
+      # is mounted read-only rather than baked into an image.
+      - ./config.yaml:/config/config.yaml:ro
+
+    environment:
+      # Only affects log timestamps.
+      - TZ=Europe/Lisbon
+
+    # The bot makes outbound connections only — to the homeserver, to Jellyfin,
+    # and to the SFU, whose address it learns at runtime. Nothing connects to
+    # it, so it needs no published ports and the default bridge network is
+    # fine. ICE works from behind the bridge NAT.
+
+    # Nothing is written outside /tmp, which is where ffmpeg's placeholder text
+    # files go. If you ever see a permissions error, drop these two lines.
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Logs are the only output; keep them from growing without bound.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

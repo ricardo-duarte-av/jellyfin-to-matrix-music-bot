@@ -5,6 +5,7 @@ package artwork
 import (
 	"bytes"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,26 +38,55 @@ func NewRenderer(ffmpegPath string) *Renderer {
 }
 
 // fontCandidates are the usual locations of a DejaVu/Liberation sans font.
+// The paths differ per distribution, and the container image is Alpine while
+// development is usually Debian, so both have to be covered.
 var fontCandidates = []string{
-	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-	"/usr/share/fonts/dejavu/DejaVuSans.ttf",
+	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian, Ubuntu
+	"/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf",      // Alpine
+	"/usr/share/fonts/dejavu/DejaVuSans.ttf",          // Fedora, RHEL
+	"/usr/share/fonts/TTF/DejaVuSans.ttf",             // Arch
 	"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-	"/usr/share/fonts/TTF/DejaVuSans.ttf",
-	"/System/Library/Fonts/Helvetica.ttc",
+	"/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+	"/System/Library/Fonts/Helvetica.ttc", // macOS
 }
 
+// fontSearchRoots are walked when no known path matches.
+var fontSearchRoots = []string{"/usr/share/fonts", "/usr/local/share/fonts"}
+
+// findFont locates a font for the placeholder tile, or returns "" to fall back
+// to a plain coloured square.
 func findFont() string {
 	for _, path := range fontCandidates {
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
 	}
-	// Last resort: any ttf under the system font directory.
-	matches, _ := filepath.Glob("/usr/share/fonts/**/*.ttf")
-	if len(matches) > 0 {
-		return matches[0]
+	// Last resort: walk the font directories. filepath.Glob does not support
+	// "**", so a pattern cannot do this — it silently matches nothing.
+	for _, root := range fontSearchRoots {
+		if found := firstFontUnder(root); found != "" {
+			return found
+		}
 	}
 	return ""
+}
+
+// firstFontUnder returns the first .ttf or .otf found beneath root.
+func firstFontUnder(root string) string {
+	var found string
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			// Unreadable directories are not worth failing over.
+			return nil //nolint:nilerr
+		}
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".ttf", ".otf":
+			found = path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // FromImage encodes cover art into an H.264 keyframe.

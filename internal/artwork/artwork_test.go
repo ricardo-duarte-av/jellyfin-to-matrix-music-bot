@@ -3,6 +3,7 @@ package artwork
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -119,5 +120,40 @@ func TestTruncate(t *testing.T) {
 	}
 	if got := []rune(truncate(strings.Repeat("x", 40), 10)); len(got) != 10 {
 		t.Errorf("truncate() produced %d runes; want 10", len(got))
+	}
+}
+
+// The placeholder needs a font, and its path differs per distribution — the
+// container image is Alpine while development is Debian. A missing font is not
+// fatal, but silently losing the text would be easy to miss.
+func TestFindFontLocatesSomething(t *testing.T) {
+	font := findFont()
+	if font == "" {
+		t.Skip("no font installed on this machine")
+	}
+	if _, err := os.Stat(font); err != nil {
+		t.Errorf("findFont() returned %q which does not exist: %v", font, err)
+	}
+	t.Logf("using font %s", font)
+}
+
+// filepath.Glob does not support "**", so a recursive pattern silently matches
+// nothing. The fallback has to walk instead.
+func TestFirstFontUnderWalksRecursively(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "a", "b")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(nested, "Some.ttf")
+	if err := os.WriteFile(want, []byte("not really a font"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := firstFontUnder(dir); got != want {
+		t.Errorf("firstFontUnder() = %q; want %q — the fallback must recurse", got, want)
+	}
+	if got := firstFontUnder(filepath.Join(dir, "nonexistent")); got != "" {
+		t.Errorf("firstFontUnder() = %q for a missing directory; want empty", got)
 	}
 }

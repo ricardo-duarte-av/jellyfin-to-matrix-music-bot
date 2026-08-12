@@ -24,9 +24,22 @@ import (
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/rtc"
 )
 
+// Stamped at build time with -ldflags; see the Dockerfile.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("musicbot %s (%s) built %s\n", version, commit, buildTime)
+		return
+	}
 
 	if err := run(*configPath); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -57,6 +70,11 @@ func run(configPath string) error {
 		return fmt.Errorf("create matrix client: %w", err)
 	}
 	client.Log = log
+	log.Info().
+		Str("version", version).
+		Str("commit", commit).
+		Str("built", buildTime).
+		Msg("starting musicbot")
 
 	// The device ID must match the one the access token belongs to: it is half
 	// of the LiveKit identity the JWT service derives.

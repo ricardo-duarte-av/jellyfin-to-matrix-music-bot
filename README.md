@@ -67,6 +67,42 @@ silent, until it is given something to play.
 of the LiveKit identity the JWT service derives. Leave it empty to have the bot
 look it up via `/whoami` at startup.
 
+## Docker
+
+Images are built by CI and published to GitHub's container registry. With the
+supplied `docker-compose.yaml`, next to your `config.yaml`:
+
+```sh
+docker compose up -d
+docker compose logs -f
+```
+
+Or directly:
+
+```sh
+docker run -d --name musicbot \
+  -v ./config.yaml:/config/config.yaml:ro \
+  ghcr.io/ricardo-duarte-av/jellyfin-to-matrix-music-bot:latest
+```
+
+The config is mounted rather than baked in, since it carries an access token and
+an API key. `.dockerignore` keeps `config.yaml` out of the build context for the
+same reason.
+
+The bot only makes outbound connections — to the homeserver, to Jellyfin, and to
+the SFU, whose address it learns at runtime — so it needs no published ports and
+works behind the default bridge network.
+
+The image is Alpine with ffmpeg, the DejaVu font for the placeholder tile, and a
+static binary — the bot has no cgo dependencies, so nothing else is needed. The
+build fails rather than the first playback if ffmpeg lacks libopus or libx264.
+
+To build it yourself:
+
+```sh
+docker build -t musicbot .
+```
+
 ## Commands
 
 | Command | Effect |

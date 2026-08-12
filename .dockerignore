@@ -1,0 +1,18 @@
+# Keep the build context small and, more importantly, keep secrets out of it.
+config.yaml
+*.local.yaml
+
+.git
+.github
+.gitignore
+.claude
+
+# Build output
+/musicbot
+*.exe
+*.test
+*.out
+coverage.*
+
+README.md
+LICENSE
