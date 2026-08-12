@@ -392,8 +392,26 @@ func (p *Player) run() {
 	c := &core{state: StateIdle}
 	defer c.stopPlayback()
 
+	// The ticker paces audio, so it only needs to run while there is audio to
+	// pace. Left running it wakes the process 50 times a second to do nothing,
+	// which is most of the bot's idle CPU: measured at 0.5% of a core, against
+	// 0.6% for the whole container sitting in a call with nothing playing.
 	ticker := time.NewTicker(rtc.FrameDuration)
 	defer ticker.Stop()
+	ticking := true
+	pace := func() {
+		want := c.state == StatePlaying && c.stream != nil
+		if want == ticking {
+			return
+		}
+		if want {
+			ticker.Reset(rtc.FrameDuration)
+		} else {
+			ticker.Stop()
+		}
+		ticking = want
+	}
+	pace()
 
 	for {
 		select {
@@ -403,12 +421,16 @@ func (p *Player) run() {
 			fn(c)
 			p.publishStatus(c)
 			p.syncTrack(c)
+			pace()
 		case <-ticker.C:
 			if c.state != StatePlaying || c.stream == nil {
+				pace()
 				continue
 			}
 			p.pump(c)
 			p.syncTrack(c)
+			// pump can end a track, which stops the stream.
+			pace()
 		}
 	}
 }

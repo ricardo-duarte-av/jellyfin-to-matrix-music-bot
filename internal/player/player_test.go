@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -437,5 +438,118 @@ func TestStatusIsFreshWhenCommandReturns(t *testing.T) {
 		if p.Status().Random {
 			t.Fatalf("iteration %d: SetRandom(false) returned before the status showed it", i)
 		}
+	}
+}
+
+// TestIdlePlayerIsCheap guards the pacing ticker against being left running.
+//
+// The ticker exists to pace audio at one frame every 20ms. Running it while
+// nothing plays wakes the process 50 times a second to do nothing, which
+// measured at 0.5% of a core — essentially the entire idle cost of the bot
+// sitting in a call. The threshold here is deliberately loose: the difference
+// between running and stopped is three orders of magnitude, so this does not
+// need to be a precise benchmark to catch a regression.
+func TestIdlePlayerIsCheap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-based")
+	}
+
+	p := New(Options{
+		Publisher:  &fakePublisher{},
+		FFmpegPath: "ffmpeg",
+		MaxQueue:   10,
+		Encode:     testEncode,
+		URLFor:     func(item jellyfin.Item) string { return "" },
+	})
+	defer p.Close()
+
+	const window = 2 * time.Second
+	time.Sleep(200 * time.Millisecond) // let startup settle
+	before := processCPU()
+	time.Sleep(window)
+	used := processCPU() - before
+
+	// A running 20ms ticker costs roughly 10ms of CPU over this window; a
+	// stopped one costs microseconds.
+	const budget = 3 * time.Millisecond
+	if used > budget {
+		t.Errorf("idle player used %v CPU over %v (%.2f%% of a core); want under %v — is the pacing ticker still running while idle?",
+			used.Round(time.Microsecond), window, float64(used)/float64(window)*100, budget)
+	}
+}
+
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+// TestTrackChangeEventsDistinguishPauseFromStop pins the contract the in-call
+// artwork depends on: pausing keeps the current track, so the tile should keep
+// showing its cover, while stopping has no current track and should put up the
+// idle card.
+func TestTrackChangeEventsDistinguishPauseFromStop(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	track := jellyfin.Item{ID: makeTone(t, dir, "tone.wav", 5, 440), Kind: jellyfin.KindTrack, Name: "Tone"}
+
+	var mu sync.Mutex
+	var events []string
+	record := func(item *jellyfin.Item) {
+		mu.Lock()
+		defer mu.Unlock()
+		if item == nil {
+			events = append(events, "idle")
+		} else {
+			events = append(events, item.Name)
+		}
+	}
+	seen := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), events...)
+	}
+
+	p := New(Options{
+		Publisher:    &fakePublisher{},
+		FFmpegPath:   "ffmpeg",
+		MaxQueue:     10,
+		Encode:       testEncode,
+		URLFor:       func(item jellyfin.Item) string { return item.ID },
+		TrackChanged: record,
+	})
+	defer p.Close()
+
+	p.Enqueue([]jellyfin.Item{track})
+	waitForEvents := func(want int) bool {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if len(seen()) >= want {
+				return true
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false
+	}
+	if !waitForEvents(1) {
+		t.Fatalf("no track change on play; got %v", seen())
+	}
+
+	p.Pause()
+	p.Resume()
+	time.Sleep(300 * time.Millisecond)
+	if got := seen(); len(got) != 1 {
+		t.Errorf("pause/resume emitted %v; want no further events, the track is unchanged", got)
+	}
+
+	p.Stop()
+	if !waitForEvents(2) {
+		t.Fatalf("stop emitted no track change; got %v", seen())
+	}
+	got := seen()
+	if got[len(got)-1] != "idle" {
+		t.Errorf("last event = %q; want idle so the tile stops showing the finished track", got[len(got)-1])
 	}
 }
