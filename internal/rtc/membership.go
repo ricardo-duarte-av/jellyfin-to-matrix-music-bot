@@ -16,7 +16,17 @@ import (
 // CallMemberEventType is the state event other MatrixRTC clients (Element Call)
 // read to discover who is in a call. This is the "session" form of MSC4143;
 // newer sticky-event membership (MSC4354) is not implemented.
-var CallMemberEventType = event.NewEventType("org.matrix.msc3401.call.member")
+//
+// The class must be set explicitly. event.NewEventType guesses it from a list
+// of known types and returns UnknownEventType for anything unstable, while
+// mautrix stamps StateEventType onto incoming state events — and both the sync
+// listener map and the room state map are keyed by type *and* class. A type
+// built with NewEventType therefore matches nothing: handlers never fire and
+// state lookups come back empty, with no error to show for it.
+var CallMemberEventType = event.Type{
+	Type:  "org.matrix.msc3401.call.member",
+	Class: event.StateEventType,
+}
 
 const (
 	// applicationCall marks the session as a call rather than some other RTC app.

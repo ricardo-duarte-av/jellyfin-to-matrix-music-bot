@@ -99,6 +99,12 @@ func (b *Bot) Run(ctx context.Context) error {
 	return b.client.SyncWithContext(ctx)
 }
 
+// isHistorical reports whether an event predates the bot starting up, so a
+// restart does not act on events it has already missed.
+func (b *Bot) isHistorical(evt *event.Event) bool {
+	return evt.Timestamp < b.startedAt.UnixMilli()
+}
+
 // primeCallWatcher seeds the watcher with the call's current participants.
 func (b *Bot) primeCallWatcher(ctx context.Context) {
 	state, err := b.client.State(ctx, b.roomID)
@@ -126,7 +132,7 @@ func (b *Bot) handleMessage(ctx context.Context, evt *event.Event) {
 	if evt.RoomID != b.roomID || evt.Sender == b.client.UserID {
 		return
 	}
-	if evt.Timestamp < b.startedAt.UnixMilli() {
+	if b.isHistorical(evt) {
 		return
 	}
 	content, ok := evt.Content.Parsed.(*event.MessageEventContent)

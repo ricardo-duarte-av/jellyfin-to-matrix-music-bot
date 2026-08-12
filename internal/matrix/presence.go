@@ -63,10 +63,24 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 	if evt.Sender == b.client.UserID {
 		return
 	}
+	// The initial sync replays the last 50 timeline events, which includes any
+	// call joins and leaves from before the bot started. Priming already
+	// established who is actually in the call, so replaying that history would
+	// only produce announcements for people who joined long ago.
+	if b.isHistorical(evt) {
+		return
+	}
 
 	// An empty content is a membership being retracted, i.e. a leave.
-	joined := len(evt.Content.VeryRaw) > 2 && !isEmptyJSONObject(evt.Content.VeryRaw)
-	if !b.calls.handleMembership(*evt.StateKey, joined) {
+	joined := !isEmptyMembership(evt)
+	announce := b.calls.handleMembership(*evt.StateKey, joined)
+	b.client.Log.Debug().
+		Str("state_key", *evt.StateKey).
+		Str("sender", evt.Sender.String()).
+		Bool("joined", joined).
+		Bool("announce", announce).
+		Msg("call membership change")
+	if !announce {
 		return
 	}
 	b.announceJoin(ctx, evt.Sender)
@@ -104,6 +118,17 @@ func (b *Bot) displayName(ctx context.Context, user id.UserID) string {
 		return user.String()
 	}
 	return localpart
+}
+
+// isEmptyMembership reports whether a membership event is a retraction. The
+// raw bytes are the reliable signal: mautrix does not parse this unstable event
+// type, so the parsed content is nil either way.
+func isEmptyMembership(evt *event.Event) bool {
+	if raw := evt.Content.VeryRaw; len(raw) > 0 {
+		return isEmptyJSONObject(raw)
+	}
+	// No raw bytes retained: fall back to the decoded map.
+	return len(evt.Content.Raw) == 0
 }
 
 // isEmptyJSONObject reports whether raw is `{}` once whitespace is ignored.
