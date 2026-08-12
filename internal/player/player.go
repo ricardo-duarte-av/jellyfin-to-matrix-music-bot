@@ -199,11 +199,17 @@ func (p *Player) Status() Status {
 }
 
 // do runs fn on the run loop and waits for it.
+//
+// The status snapshot is refreshed before the caller is released, not after.
+// Otherwise a command could return while Status() still described the state
+// before it ran — so !next at the end of a queue could be followed by a
+// !nowplaying still naming the finished track.
 func (p *Player) do(fn func(*core)) {
 	ack := make(chan struct{})
 	select {
 	case p.cmds <- func(c *core) {
 		fn(c)
+		p.publishStatus(c)
 		close(ack)
 	}:
 		<-ack

@@ -400,3 +400,42 @@ func TestRandomAndRepeatReportedInStatus(t *testing.T) {
 		t.Errorf("after disabling random = random %v repeat %v; want off/on", s.Random, s.Repeat)
 	}
 }
+
+// TestStatusIsFreshWhenCommandReturns pins the ordering between a command
+// finishing and the status snapshot being updated.
+//
+// The status used to be published after the caller was released, so a command
+// could return while Status() still described the state before it ran. It only
+// showed up as a rare CI failure, but the user-visible version is a !next at
+// the end of a queue followed by a !nowplaying that still names the old track.
+func TestStatusIsFreshWhenCommandReturns(t *testing.T) {
+	// No ffmpeg needed: an unplayable URL fails immediately, which is enough to
+	// exercise the ordering.
+	p := New(Options{
+		Publisher:  &fakePublisher{},
+		FFmpegPath: "/nonexistent-ffmpeg",
+		MaxQueue:   10,
+		Encode:     testEncode,
+		URLFor:     func(item jellyfin.Item) string { return "" },
+	})
+	defer p.Close()
+
+	for i := 0; i < 500; i++ {
+		p.Enqueue([]jellyfin.Item{{ID: "x", Kind: jellyfin.KindTrack, Name: "X"}})
+
+		p.Stop()
+		if got := p.Status(); got.State != StateIdle || len(got.Queue) != 0 {
+			t.Fatalf("iteration %d: after Stop() status = %q with %d queued; want idle and empty",
+				i, got.State, len(got.Queue))
+		}
+
+		p.SetRandom(true)
+		if !p.Status().Random {
+			t.Fatalf("iteration %d: SetRandom(true) returned before the status showed it", i)
+		}
+		p.SetRandom(false)
+		if p.Status().Random {
+			t.Fatalf("iteration %d: SetRandom(false) returned before the status showed it", i)
+		}
+	}
+}
