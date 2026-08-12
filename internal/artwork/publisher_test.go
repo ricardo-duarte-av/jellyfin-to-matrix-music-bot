@@ -56,7 +56,9 @@ func (l *fakeLibrary) callCount() int {
 func newTestPublisher(t *testing.T, lib Library) (*Publisher, *fakeSink) {
 	t.Helper()
 	sink := &fakeSink{}
-	p := NewPublisher(NewRenderer("ffmpeg"), lib, sink, zerolog.New(io.Discard))
+	p := NewPublisher(NewRenderer("ffmpeg"), lib, sink,
+		IdleText{Title: "Nothing playing", Hint: "!play <song>"},
+		zerolog.New(io.Discard))
 	t.Cleanup(p.Close)
 	return p, sink
 }
@@ -133,14 +135,34 @@ func TestPublisherFallsBackWhenRenderFails(t *testing.T) {
 	}
 }
 
-func TestPublisherIgnoresNilItem(t *testing.T) {
+// Stopping must not leave the last cover frozen on screen: it would say the bot
+// is still playing a track that finished.
+func TestPublisherShowsIdleCardWhenStopped(t *testing.T) {
 	requireFFmpeg(t)
-	p, sink := newTestPublisher(t, &fakeLibrary{cover: makeCover(t)})
+	lib := &fakeLibrary{cover: makeCover(t)}
+	p, sink := newTestPublisher(t, lib)
+
+	p.Show(&jellyfin.Item{ID: "t1", Name: "Track", ArtworkID: "album1"})
+	if !waitFor(t, func() bool { return sink.count() == 1 }) {
+		t.Fatal("cover never published")
+	}
 
 	p.Show(nil)
-	time.Sleep(200 * time.Millisecond)
-	if got := sink.count(); got != 0 {
-		t.Errorf("published %d frames for a nil item; want the last cover left in place", got)
+	if !waitFor(t, func() bool { return sink.count() == 2 }) {
+		t.Fatalf("no idle card published on stop; got %d frames", sink.count())
+	}
+
+	// Staying stopped should not re-render the same card.
+	p.Show(nil)
+	time.Sleep(300 * time.Millisecond)
+	if got := sink.count(); got != 2 {
+		t.Errorf("published %d frames; the idle card should render once", got)
+	}
+
+	// Playing again returns to the cover.
+	p.Show(&jellyfin.Item{ID: "t2", Name: "Track", ArtworkID: "album2"})
+	if !waitFor(t, func() bool { return sink.count() == 3 }) {
+		t.Errorf("cover not restored after idle; got %d frames", sink.count())
 	}
 }
 

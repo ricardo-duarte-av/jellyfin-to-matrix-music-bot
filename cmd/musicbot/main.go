@@ -174,8 +174,16 @@ func run(configPath string) error {
 		if err := publisher.PublishVideo(cfg.RTC.DisplayName); err != nil {
 			client.Log.Warn().Err(err).Msg("could not publish album art video track; continuing audio-only")
 		} else {
-			artPublisher = artwork.NewPublisher(artwork.NewRenderer(cfg.Player.FFmpegPath), jf, publisher, log)
+			artPublisher = artwork.NewPublisher(
+				artwork.NewRenderer(cfg.Player.FFmpegPath), jf, publisher,
+				artwork.IdleText{
+					Title: "Nothing playing",
+					Hint:  cfg.Matrix.CommandPrefix + "play <song>",
+				},
+				log)
 			defer artPublisher.Close()
+			// Put the idle card up straight away, so the tile is never blank.
+			artPublisher.Show(nil)
 			client.Log.Info().Msg("publishing album art as a video track")
 		}
 	}

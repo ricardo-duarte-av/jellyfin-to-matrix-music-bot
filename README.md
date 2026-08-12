@@ -199,6 +199,11 @@ Chat images carry a thumbnail and a blurhash, so clients have something to show
 before the full cover loads. Both come from a second, smaller fetch of the same
 cover — Jellyfin scales server-side, so there is no local resizing.
 
+When nothing is playing the tile shows an idle card naming the command to start
+something, rather than leaving the last cover up — a frozen cover would say the
+bot is still playing a track that finished. Pausing keeps the cover, since that
+track is still current and will resume.
+
 Covers come from Jellyfin, falling back to the album's art for a track with no
 cover of its own, and to a generated tile carrying the track and artist names
 when there is no art at all. Chat uploads are cached per cover, so a 20-track
