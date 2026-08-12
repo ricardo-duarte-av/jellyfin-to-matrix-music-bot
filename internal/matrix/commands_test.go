@@ -407,6 +407,27 @@ func TestAdvertisedCommandsAreHandled(t *testing.T) {
 	}
 }
 
+// MSC4391 describes "parameters" as an array. Go marshals a nil slice to null,
+// which a client validating descriptions against the schema rejects, so every
+// argument-less command would go unoffered.
+func TestPublishedDescriptionsAlwaysCarryAParameterArray(t *testing.T) {
+	for _, spec := range commandSpecs() {
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatalf("marshalling %q: %v", spec.Command, err)
+		}
+		var content struct {
+			Parameters *[]json.RawMessage `json:"parameters"`
+		}
+		if err := json.Unmarshal(raw, &content); err != nil {
+			t.Fatalf("unmarshalling %q: %v", spec.Command, err)
+		}
+		if content.Parameters == nil {
+			t.Errorf("command %q published %s; want an array for parameters", spec.Command, raw)
+		}
+	}
+}
+
 // Matrix does not deduplicate state events: re-sending identical content still
 // writes a new event. Without this check the bot would add one event per
 // command to room state on every restart, forever.

@@ -93,7 +93,7 @@ func commandSpecs() []commandSpec {
 	// is a query.
 	selection := arrayOf(union(primitive("integer"), primitive("string")))
 
-	return []commandSpec{
+	specs := []commandSpec{
 		{
 			Command:     "search",
 			Description: describe("Search the music library"),
@@ -154,6 +154,17 @@ func commandSpecs() []commandSpec {
 		{Command: "stop", Description: describe("Stop playing and empty the queue")},
 		{Command: "help", Description: describe("List the commands")},
 	}
+
+	// A nil slice marshals to "parameters": null, but MSC4391 describes
+	// parameters as an array. A client validating the description against that
+	// schema drops the command, so an argument-less command like stop or help
+	// would never be offered or sent.
+	for i := range specs {
+		if specs[i].Parameters == nil {
+			specs[i].Parameters = []paramSpec{}
+		}
+	}
+	return specs
 }
 
 // descriptionStateKey is the state key a command description lives under.
