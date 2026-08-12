@@ -13,18 +13,30 @@ import (
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/rtc"
 )
 
-// callWatcher announces people joining the call.
+// callChange is what a membership event amounts to once the previous state is
+// taken into account.
+type callChange int
+
+const (
+	// callNoChange covers a membership that was already recorded either way:
+	// state events are re-sent on every update, and only transitions matter.
+	callNoChange callChange = iota
+	callJoined
+	callLeft
+)
+
+// callWatcher announces people joining and leaving the call.
 //
-// Call membership lives in room state, so the bot sees joins as state events
-// for free. The wrinkle is that a sync also replays the state that was already
-// there: those must be recorded silently, or every restart would announce
-// everyone currently in the call.
+// Call membership lives in room state, so the bot sees the changes as state
+// events for free. The wrinkle is that a sync also replays the state that was
+// already there: those must be recorded silently, or every restart would
+// announce everyone currently in the call.
 type callWatcher struct {
 	mu sync.Mutex
 	// present holds the membership state keys currently in the call.
 	present map[string]bool
 	// primed is false until the first sync has established who was already
-	// there, during which joins are recorded without announcing.
+	// there, during which memberships are recorded without announcing.
 	primed bool
 }
 
@@ -32,9 +44,9 @@ func newCallWatcher() *callWatcher {
 	return &callWatcher{present: make(map[string]bool)}
 }
 
-// handleMembership records a membership change and reports whether it is a
-// join worth announcing.
-func (w *callWatcher) handleMembership(stateKey string, joined bool) (announce bool) {
+// handleMembership records a membership change and reports the transition it
+// represents, if any.
+func (w *callWatcher) handleMembership(stateKey string, joined bool) callChange {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -44,7 +56,30 @@ func (w *callWatcher) handleMembership(stateKey string, joined bool) (announce b
 	} else {
 		delete(w.present, stateKey)
 	}
-	return joined && !was && w.primed
+	if !w.primed || joined == was {
+		return callNoChange
+	}
+	if joined {
+		return callJoined
+	}
+	return callLeft
+}
+
+// stillPresent reports whether the user behind a membership state key has any
+// other membership in the call.
+//
+// One person can be in a call from several devices, and each device gets its
+// own membership. Announcing a leave when only one of them dropped would be
+// wrong, so the other keys are checked before saying someone left.
+func (w *callWatcher) stillPresent(userID id.UserID) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for stateKey := range w.present {
+		if strings.Contains(stateKey, userID.String()) {
+			return true
+		}
+	}
+	return false
 }
 
 // prime marks the initial state as seen, so subsequent joins are announced.
@@ -73,24 +108,31 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 
 	// An empty content is a membership being retracted, i.e. a leave.
 	joined := !isEmptyMembership(evt)
-	announce := b.calls.handleMembership(*evt.StateKey, joined)
+	change := b.calls.handleMembership(*evt.StateKey, joined)
 	b.client.Log.Debug().
 		Str("state_key", *evt.StateKey).
 		Str("sender", evt.Sender.String()).
 		Bool("joined", joined).
-		Bool("announce", announce).
+		Int("change", int(change)).
 		Msg("call membership change")
-	if !announce {
-		return
+
+	switch change {
+	case callJoined:
+		b.announcePresence(ctx, evt.Sender, "joined")
+	case callLeft:
+		// Someone in the call from two devices who closes one has not left.
+		if b.calls.stillPresent(evt.Sender) {
+			return
+		}
+		b.announcePresence(ctx, evt.Sender, "left")
 	}
-	b.announceJoin(ctx, evt.Sender)
 }
 
-// announceJoin posts "<pill> joined the call".
-func (b *Bot) announceJoin(ctx context.Context, user id.UserID) {
+// announcePresence posts "<pill> joined/left the call".
+func (b *Bot) announcePresence(ctx context.Context, user id.UserID, verb string) {
 	name := b.displayName(ctx, user)
-	plain := fmt.Sprintf("%s joined the call.", name)
-	formatted := fmt.Sprintf(`%s joined the call.`, userPill(user, name))
+	plain := fmt.Sprintf("%s %s the call.", name, verb)
+	formatted := fmt.Sprintf("%s %s the call.", userPill(user, name), verb)
 	b.send(ctx, plain, formatted)
 }
 

@@ -183,35 +183,65 @@ func TestUserPillEscapesDisplayName(t *testing.T) {
 func TestCallWatcherSuppressesInitialState(t *testing.T) {
 	w := newCallWatcher()
 
-	if w.handleMembership("_@alice:example.org_DEV", true) {
-		t.Error("announced a join before priming; initial state must be silent")
+	if got := w.handleMembership("_@alice:example.org_DEV", true); got != callNoChange {
+		t.Errorf("got %v before priming; initial state must be silent", got)
 	}
 	w.prime()
 
-	if !w.handleMembership("_@bob:example.org_DEV", true) {
-		t.Error("did not announce a join after priming")
+	if got := w.handleMembership("_@bob:example.org_DEV", true); got != callJoined {
+		t.Errorf("got %v for a join after priming; want callJoined", got)
 	}
-	if w.handleMembership("_@bob:example.org_DEV", true) {
-		t.Error("announced the same membership twice; state events are re-sent on update")
+	// State events are re-sent on every update, so a repeat is not a new join.
+	if got := w.handleMembership("_@bob:example.org_DEV", true); got != callNoChange {
+		t.Errorf("got %v for a repeated membership; want callNoChange", got)
 	}
-	if w.handleMembership("_@alice:example.org_DEV", true) {
-		t.Error("announced a join for someone already present at prime time")
+	if got := w.handleMembership("_@alice:example.org_DEV", true); got != callNoChange {
+		t.Errorf("got %v for someone already present at prime time; want callNoChange", got)
 	}
 }
 
-// Leaving and rejoining should announce again.
-func TestCallWatcherAnnouncesRejoin(t *testing.T) {
+func TestCallWatcherAnnouncesLeaveAndRejoin(t *testing.T) {
 	w := newCallWatcher()
 	w.prime()
 
-	if !w.handleMembership("_@bob:example.org_DEV", true) {
-		t.Fatal("first join not announced")
+	if got := w.handleMembership("_@bob:example.org_DEV", true); got != callJoined {
+		t.Fatalf("got %v for the first join; want callJoined", got)
 	}
-	if w.handleMembership("_@bob:example.org_DEV", false) {
-		t.Error("a leave should not be announced as a join")
+	if got := w.handleMembership("_@bob:example.org_DEV", false); got != callLeft {
+		t.Errorf("got %v for a leave; want callLeft", got)
 	}
-	if !w.handleMembership("_@bob:example.org_DEV", true) {
-		t.Error("rejoin after leaving was not announced")
+	// A retraction for someone already gone is not a second leave.
+	if got := w.handleMembership("_@bob:example.org_DEV", false); got != callNoChange {
+		t.Errorf("got %v for a repeated leave; want callNoChange", got)
+	}
+	if got := w.handleMembership("_@bob:example.org_DEV", true); got != callJoined {
+		t.Errorf("got %v for a rejoin; want callJoined", got)
+	}
+}
+
+// Someone in the call from two devices who closes one has not left.
+func TestCallWatcherTracksMultipleDevices(t *testing.T) {
+	w := newCallWatcher()
+	w.prime()
+
+	w.handleMembership("_@bob:example.org_PHONE", true)
+	w.handleMembership("_@bob:example.org_LAPTOP", true)
+
+	if got := w.handleMembership("_@bob:example.org_LAPTOP", false); got != callLeft {
+		t.Fatalf("got %v when one device left; want callLeft", got)
+	}
+	if !w.stillPresent("@bob:example.org") {
+		t.Error("stillPresent() = false while another device is in the call")
+	}
+
+	if got := w.handleMembership("_@bob:example.org_PHONE", false); got != callLeft {
+		t.Fatalf("got %v when the last device left; want callLeft", got)
+	}
+	if w.stillPresent("@bob:example.org") {
+		t.Error("stillPresent() = true after every device left")
+	}
+	if w.stillPresent("@someoneelse:example.org") {
+		t.Error("stillPresent() matched a user who was never in the call")
 	}
 }
 

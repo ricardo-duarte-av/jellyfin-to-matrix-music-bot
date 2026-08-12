@@ -103,8 +103,10 @@ restarts; either command with no argument reports its current state.
 `!stop`, `!clear` and `!skip` are limited to `matrix.admins`. Leave that list
 empty to let everyone use them.
 
-The bot also announces people joining the call, with their name as a pill. The
-participants already present when it starts are not announced.
+The bot also announces people joining and leaving the call, with their name as a
+pill. Participants already present when it starts are not announced, and someone
+in the call from several devices is only reported as leaving once the last of
+them goes.
 
 ## Audio quality
 
