@@ -12,12 +12,17 @@ import (
 )
 
 // Size is the square the artwork is fitted into. Covers are square, and a
-// square tile avoids letterboxing in the call layout.
-const Size = 480
+// square tile avoids letterboxing in the call layout. 720 is chosen so the
+// tile still looks sharp when a client gives the bot a large tile or
+// full-screens it.
+const Size = 720
 
-// bitrate is the encoder's target for the single frame. A still needs far less
-// than moving video; 300k lands a 480x480 cover at roughly 7KB.
-const bitrate = "300k"
+// quality is the x264 constant-rate factor. The bot sends one frame per track
+// rather than a stream, so rate control by bitrate is the wrong tool: a
+// bitrate cap quantises the single frame heavily and the cover arrives blurry.
+// CRF 20 keeps it visibly clean at roughly 75KB, which is nothing spread over
+// a track.
+const quality = "20"
 
 // Renderer encodes images to H.264 keyframes using ffmpeg.
 type Renderer struct {
@@ -132,7 +137,7 @@ func (r *Renderer) encode(source []string, filter string, stdin []byte) ([]byte,
 		// Every frame a keyframe: the bot only ever sends standalone stills.
 		// sei=0 drops x264's version banner, ~600 bytes of nothing.
 		"-x264-params", "keyint=1:scenecut=0:sei=0",
-		"-b:v", bitrate,
+		"-crf", quality,
 		"-f", "h264",
 		"-",
 	)

@@ -60,7 +60,7 @@ func newVideoTrack(room *lksdk.Room, name string) (*videoTrack, error) {
 }
 
 // videoSize must match what the renderer produces.
-const videoSize = 480
+const videoSize = 720
 
 // SetKeyframe replaces the displayed image and sends it immediately.
 func (v *videoTrack) SetKeyframe(frame []byte) error {

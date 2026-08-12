@@ -65,9 +65,10 @@ func TestFromImageProducesKeyframe(t *testing.T) {
 	// The access unit must carry its own parameter sets and an IDR picture, or
 	// a receiver joining later has nothing to decode against.
 	assertSelfContainedKeyframe(t, frame)
-	// Sanity on size: far too large means the encoder ignored the bitrate.
-	if len(frame) > 60_000 {
-		t.Errorf("keyframe is %d bytes; expected well under 60KB", len(frame))
+	// Sanity on size: a whole megabyte would mean rate control is not applying
+	// at all. A real cover at CRF 20 lands around 75KB.
+	if len(frame) > 500_000 {
+		t.Errorf("keyframe is %d bytes; expected well under 500KB", len(frame))
 	}
 	t.Logf("keyframe %d bytes", len(frame))
 }

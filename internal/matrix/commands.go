@@ -55,6 +55,17 @@ func intArgs(args []string) ([]int, bool) {
 	return out, true
 }
 
+// parseOnOff reads the argument of a toggle command.
+func parseOnOff(arg string) (on bool, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "on", "yes", "true", "enable", "enabled", "1":
+		return true, true
+	case "off", "no", "false", "disable", "disabled", "0":
+		return false, true
+	}
+	return false, false
+}
+
 // canonicalName maps command aliases to their canonical name.
 func canonicalName(name string) string {
 	switch name {
@@ -78,6 +89,10 @@ func canonicalName(name string) string {
 		return "help"
 	case "ls", "results":
 		return "list"
+	case "shuffle", "rand":
+		return "random"
+	case "loop":
+		return "repeat"
 	}
 	return name
 }

@@ -320,3 +320,83 @@ func TestQueueLimit(t *testing.T) {
 		t.Errorf("Enqueue() = %d, %v; want 2, true", added, truncated)
 	}
 }
+
+// TestRandomPlaysEveryTrackOnce checks that shuffle works through the queue as
+// a bag rather than picking blindly, which would replay tracks while others
+// went unheard.
+func TestRandomPlaysEveryTrackOnce(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	tone := makeTone(t, dir, "tone.wav", 5, 440)
+
+	var tracks []jellyfin.Item
+	for _, name := range []string{"A", "B", "C", "D", "E"} {
+		tracks = append(tracks, jellyfin.Item{ID: tone, Kind: jellyfin.KindTrack, Name: name})
+	}
+
+	p := newTestPlayer(t, &fakePublisher{})
+	p.SetRandom(true)
+	p.Enqueue(tracks)
+
+	seen := map[string]int{}
+	if current := p.Status().Current; current != nil {
+		seen[current.Name]++
+	}
+	// Four more advances should exhaust the queue exactly.
+	for i := 0; i < len(tracks)-1; i++ {
+		if !p.Next() {
+			t.Fatalf("Next() returned false after %d of %d tracks", i+1, len(tracks))
+		}
+		if current := p.Status().Current; current != nil {
+			seen[current.Name]++
+		}
+	}
+	if len(seen) != len(tracks) {
+		t.Errorf("played %d distinct tracks (%v); want all %d before repeating", len(seen), seen, len(tracks))
+	}
+	// With repeat off the pass ends here.
+	if p.Next() {
+		t.Error("Next() = true after every track played with repeat off; want false")
+	}
+}
+
+func TestRepeatLoopsTheQueue(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	tone := makeTone(t, dir, "tone.wav", 5, 440)
+	tracks := []jellyfin.Item{
+		{ID: tone, Kind: jellyfin.KindTrack, Name: "A"},
+		{ID: tone, Kind: jellyfin.KindTrack, Name: "B"},
+	}
+
+	p := newTestPlayer(t, &fakePublisher{})
+	p.Enqueue(tracks)
+	p.SetRepeat(true)
+
+	if !p.Next() {
+		t.Fatal("Next() to the second track failed")
+	}
+	// At the end of the queue, repeat should wrap to the start.
+	if !p.Next() {
+		t.Fatal("Next() = false at the end of the queue with repeat on; want it to wrap")
+	}
+	if current := p.Status().Current; current == nil || current.Name != "A" {
+		t.Errorf("after wrapping, current = %v; want A", current)
+	}
+}
+
+func TestRandomAndRepeatReportedInStatus(t *testing.T) {
+	p := newTestPlayer(t, &fakePublisher{})
+	if s := p.Status(); s.Random || s.Repeat {
+		t.Errorf("defaults = random %v repeat %v; want both off", s.Random, s.Repeat)
+	}
+	p.SetRandom(true)
+	p.SetRepeat(true)
+	if s := p.Status(); !s.Random || !s.Repeat {
+		t.Errorf("after enabling = random %v repeat %v; want both on", s.Random, s.Repeat)
+	}
+	p.SetRandom(false)
+	if s := p.Status(); s.Random || !s.Repeat {
+		t.Errorf("after disabling random = random %v repeat %v; want off/on", s.Random, s.Repeat)
+	}
+}

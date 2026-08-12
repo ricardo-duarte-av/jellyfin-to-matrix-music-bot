@@ -81,6 +81,8 @@ look it up via `/whoami` at startup.
 | `!pause` / `!resume` | pause or resume |
 | `!next` / `!prev` | move through the queue |
 | `!skip <n>` | jump to queue position n |
+| `!random on\|off` | shuffle the queue (off by default) |
+| `!repeat on\|off` | loop the queue when it ends |
 | `!clear` | drop everything after the current track |
 | `!stop` | stop and empty the queue |
 
@@ -93,8 +95,16 @@ Playing an artist, album or playlist expands it into its tracks. Search results
 expire after `player.result_ttl`, so a stale number cannot play the wrong thing
 much later.
 
+`!random` works through the queue as a bag: every track plays once before any
+repeats, rather than picking blindly and replaying the same one. With `!repeat`
+on, exhausting the queue starts a fresh pass. Both settings last until the bot
+restarts; either command with no argument reports its current state.
+
 `!stop`, `!clear` and `!skip` are limited to `matrix.admins`. Leave that list
 empty to let everyone use them.
+
+The bot also announces people joining the call, with their name as a pill. The
+participants already present when it starts are not announced.
 
 ## Audio quality
 
@@ -139,11 +149,20 @@ PLI keyframe requests, which is how someone joining mid-song gets a picture,
 with a slow periodic re-send as a safety net. That works out at roughly 12KB per
 track change rather than a continuous video stream.
 
+Chat images carry a thumbnail and a blurhash, so clients have something to show
+before the full cover loads. Both come from a second, smaller fetch of the same
+cover — Jellyfin scales server-side, so there is no local resizing.
+
 Covers come from Jellyfin, falling back to the album's art for a track with no
 cover of its own, and to a generated tile carrying the track and artist names
 when there is no art at all. Chat uploads are cached per cover, so a 20-track
 album uploads its art once. None of this is load-bearing: if artwork fails at
 any point the bot carries on and simply announces tracks as text.
+
+The video tile is encoded at 720x720 with x264's constant-rate factor rather
+than a bitrate cap. Rate control by bitrate is the wrong tool for a single
+frame: it quantises the picture heavily and the cover arrives visibly blurry.
+CRF 20 lands a cover at roughly 75KB, which is nothing spread over a track.
 
 ## Testing
 

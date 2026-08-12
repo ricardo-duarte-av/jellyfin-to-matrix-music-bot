@@ -4,6 +4,7 @@ package player
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -28,6 +29,8 @@ type Status struct {
 	Elapsed  time.Duration
 	Queue    []jellyfin.Item
 	Position int
+	Random   bool
+	Repeat   bool
 }
 
 // Publisher is the audio sink; rtc.Publisher satisfies it.
@@ -70,6 +73,15 @@ type core struct {
 
 	stream  *stream
 	elapsed time.Duration
+
+	// random plays the queue in a shuffled order, repeat loops it once it runs
+	// out. Both live only as long as the process, by design.
+	random bool
+	repeat bool
+	// played tracks which queue positions this shuffle pass has used, so
+	// random play works through the queue rather than picking blindly and
+	// replaying the same track.
+	played map[int]bool
 	// announced is what the last track-change callback reported, so the run
 	// loop can emit one event per actual change.
 	announced string
@@ -249,10 +261,28 @@ func (p *Player) PlayNow(items []jellyfin.Item) (added int, truncated bool) {
 		}
 		added = len(items)
 
+		// Inserting shifts every later index, so the shuffle bag no longer
+		// refers to the tracks it was recorded against.
 		c.queue = slices.Insert(c.queue, insertAt, items...)
+		c.played = nil
 		c.startAt(p, insertAt)
 	})
 	return added, truncated
+}
+
+// SetRandom turns shuffled playback on or off.
+func (p *Player) SetRandom(on bool) {
+	p.do(func(c *core) {
+		c.random = on
+		// A fresh shuffle pass, so turning it on mid-queue does not think most
+		// of the queue has already been played.
+		c.played = nil
+	})
+}
+
+// SetRepeat turns queue looping on or off.
+func (p *Player) SetRepeat(on bool) {
+	p.do(func(c *core) { c.repeat = on })
 }
 
 // Pause stops feeding audio but keeps the track and ffmpeg alive.
@@ -277,16 +307,17 @@ func (p *Player) Resume() (ok bool) {
 	return ok
 }
 
-// Next skips to the following track.
+// Next skips to the following track, honouring random and repeat.
 func (p *Player) Next() (ok bool) {
 	p.do(func(c *core) {
-		if c.position+1 >= len(c.queue) {
+		next := c.nextIndex()
+		if next < 0 {
 			c.stopPlayback()
 			c.position = len(c.queue)
 			ok = false
 			return
 		}
-		c.startAt(p, c.position+1)
+		c.startAt(p, next)
 		ok = true
 	})
 	return ok
@@ -325,6 +356,7 @@ func (p *Player) Stop() {
 		c.stopPlayback()
 		c.queue = nil
 		c.position = 0
+		c.played = nil
 	})
 }
 
@@ -335,6 +367,7 @@ func (p *Player) Clear() (removed int) {
 			removed = len(c.queue)
 			c.queue = nil
 			c.position = 0
+			c.played = nil
 			return
 		}
 		// Keep everything up to and including the current track.
@@ -404,16 +437,56 @@ func (p *Player) trackEnded(c *core) {
 	if err != nil && current != nil {
 		p.notify(fmt.Sprintf("Skipping %s: %v", current.Describe(), err))
 	}
-	if c.position+1 < len(c.queue) {
-		c.startAt(p, c.position+1)
-		if item := c.currentItem(); item != nil {
-			p.notify("Now playing: " + item.Describe())
-		}
+	if next := c.nextIndex(); next >= 0 {
+		c.startAt(p, next)
 		return
 	}
 	c.position = len(c.queue)
 	p.notify("Queue finished.")
 	p.publishStatus(c)
+}
+
+// nextIndex picks what to play after the current track, or -1 when the queue
+// is done. It is where random and repeat actually take effect.
+func (c *core) nextIndex() int {
+	if len(c.queue) == 0 {
+		return -1
+	}
+	if !c.random {
+		if c.position+1 < len(c.queue) {
+			return c.position + 1
+		}
+		if c.repeat {
+			return 0
+		}
+		return -1
+	}
+
+	// Shuffle works through the queue rather than picking blindly, so every
+	// track plays once before any repeats.
+	candidates := make([]int, 0, len(c.queue))
+	for i := range c.queue {
+		if !c.played[i] {
+			candidates = append(candidates, i)
+		}
+	}
+	if len(candidates) == 0 {
+		if !c.repeat {
+			return -1
+		}
+		// Start a new pass, avoiding an immediate repeat of the track just
+		// finished when there is anything else to choose.
+		c.played = nil
+		for i := range c.queue {
+			if i != c.position || len(c.queue) == 1 {
+				candidates = append(candidates, i)
+			}
+		}
+		if len(candidates) == 0 {
+			return -1
+		}
+	}
+	return candidates[rand.IntN(len(candidates))]
 }
 
 // startAt begins playing queue entry idx, replacing anything already playing.
@@ -424,6 +497,10 @@ func (c *core) startAt(p *Player, idx int) {
 		return
 	}
 	c.position = idx
+	if c.played == nil {
+		c.played = make(map[int]bool, len(c.queue))
+	}
+	c.played[idx] = true
 	item := c.queue[idx]
 
 	s, err := openStream(p.ffmpegPath, p.urlFor(item), p.encode)
@@ -472,6 +549,8 @@ func (p *Player) publishStatus(c *core) {
 		Elapsed:  c.elapsed,
 		Queue:    queue,
 		Position: c.position,
+		Random:   c.random,
+		Repeat:   c.repeat,
 	}
 	p.statusMu.Unlock()
 }

@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,5 +141,87 @@ func TestBestMatchPrefersTrack(t *testing.T) {
 	noTracks := []jellyfin.Item{{ID: "artist", Kind: jellyfin.KindArtist}}
 	if got := bestMatch(noTracks); got.ID != "artist" {
 		t.Errorf("bestMatch() with no tracks = %q; want the first item", got.ID)
+	}
+}
+
+func TestParseOnOff(t *testing.T) {
+	for _, arg := range []string{"on", "ON", "yes", "true", "enable", "1"} {
+		if on, ok := parseOnOff(arg); !ok || !on {
+			t.Errorf("parseOnOff(%q) = %v, %v; want true, true", arg, on, ok)
+		}
+	}
+	for _, arg := range []string{"off", "OFF", "no", "false", "disable", "0"} {
+		if on, ok := parseOnOff(arg); !ok || on {
+			t.Errorf("parseOnOff(%q) = %v, %v; want false, true", arg, on, ok)
+		}
+	}
+	for _, arg := range []string{"", "maybe", "toggle"} {
+		if _, ok := parseOnOff(arg); ok {
+			t.Errorf("parseOnOff(%q) reported a valid toggle; want not ok", arg)
+		}
+	}
+}
+
+func TestUserPillRendersMatrixToLink(t *testing.T) {
+	got := userPill("@daedric:aguiarvieira.pt", "Ricardo Duarte")
+	want := `<a href="https://matrix.to/#/@daedric:aguiarvieira.pt">Ricardo Duarte</a>`
+	if got != want {
+		t.Errorf("userPill() = %q; want %q", got, want)
+	}
+}
+
+// A display name is arbitrary user input and must not be able to inject markup.
+func TestUserPillEscapesDisplayName(t *testing.T) {
+	got := userPill("@evil:example.org", `<img src=x onerror=alert(1)>`)
+	if strings.Contains(got, "<img") {
+		t.Errorf("userPill() left raw markup in the output: %q", got)
+	}
+}
+
+// The initial sync replays existing memberships; those must not be announced,
+// or every restart would report everyone already in the call as joining.
+func TestCallWatcherSuppressesInitialState(t *testing.T) {
+	w := newCallWatcher()
+
+	if w.handleMembership("_@alice:example.org_DEV", true) {
+		t.Error("announced a join before priming; initial state must be silent")
+	}
+	w.prime()
+
+	if !w.handleMembership("_@bob:example.org_DEV", true) {
+		t.Error("did not announce a join after priming")
+	}
+	if w.handleMembership("_@bob:example.org_DEV", true) {
+		t.Error("announced the same membership twice; state events are re-sent on update")
+	}
+	if w.handleMembership("_@alice:example.org_DEV", true) {
+		t.Error("announced a join for someone already present at prime time")
+	}
+}
+
+// Leaving and rejoining should announce again.
+func TestCallWatcherAnnouncesRejoin(t *testing.T) {
+	w := newCallWatcher()
+	w.prime()
+
+	if !w.handleMembership("_@bob:example.org_DEV", true) {
+		t.Fatal("first join not announced")
+	}
+	if w.handleMembership("_@bob:example.org_DEV", false) {
+		t.Error("a leave should not be announced as a join")
+	}
+	if !w.handleMembership("_@bob:example.org_DEV", true) {
+		t.Error("rejoin after leaving was not announced")
+	}
+}
+
+func TestIsEmptyJSONObject(t *testing.T) {
+	for _, raw := range []string{"{}", " {} ", "", "null"} {
+		if !isEmptyJSONObject([]byte(raw)) {
+			t.Errorf("isEmptyJSONObject(%q) = false; want true", raw)
+		}
+	}
+	if isEmptyJSONObject([]byte(`{"application":"m.call"}`)) {
+		t.Error("a populated membership was treated as empty")
 	}
 }

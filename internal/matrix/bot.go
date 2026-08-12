@@ -26,6 +26,7 @@ type Bot struct {
 	player  *player.Player
 	results *results
 	artwork *artworkCache
+	calls   *callWatcher
 	// art renders the in-call video tile; nil when video is not published.
 	art    ArtPublisher
 	roomID id.RoomID
@@ -71,6 +72,7 @@ func New(cfg *config.Config, client *mautrix.Client, jf *jellyfin.Client, plr *p
 		player:    plr,
 		results:   newResults(cfg.Player.ResultTTL),
 		artwork:   newArtworkCache(artworkCacheSize),
+		calls:     newCallWatcher(),
 		roomID:    id.RoomID(cfg.Matrix.RoomID),
 		startedAt: time.Now(),
 	}
@@ -85,7 +87,32 @@ func (b *Bot) Run(ctx context.Context) error {
 	syncer.OnEventType(event.EventMessage, func(ctx context.Context, evt *event.Event) {
 		b.handleMessage(ctx, evt)
 	})
+	syncer.OnEventType(callMemberEventType, func(ctx context.Context, evt *event.Event) {
+		b.handleCallMember(ctx, evt)
+	})
+
+	// Record who is already in the call before syncing. The initial sync
+	// replays that same state, and without this the bot would announce every
+	// existing participant as a fresh arrival on every restart.
+	b.primeCallWatcher(ctx)
+
 	return b.client.SyncWithContext(ctx)
+}
+
+// primeCallWatcher seeds the watcher with the call's current participants.
+func (b *Bot) primeCallWatcher(ctx context.Context) {
+	state, err := b.client.State(ctx, b.roomID)
+	if err != nil {
+		b.client.Log.Warn().Err(err).Msg("could not read current call participants")
+	} else {
+		for stateKey, evt := range state[callMemberEventType] {
+			if evt == nil || isEmptyJSONObject(evt.Content.VeryRaw) {
+				continue
+			}
+			b.calls.handleMembership(stateKey, true)
+		}
+	}
+	b.calls.prime()
 }
 
 // Notify posts a message to the streaming room. It is the player's callback.
@@ -163,6 +190,10 @@ func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 		}
 	case "skip":
 		b.cmdSkip(ctx, cmd)
+	case "random":
+		b.cmdToggle(ctx, cmd, "Random", b.player.Status().Random, b.player.SetRandom)
+	case "repeat":
+		b.cmdToggle(ctx, cmd, "Repeat", b.player.Status().Repeat, b.player.SetRepeat)
 	case "clear":
 		removed := b.player.Clear()
 		b.reply(ctx, fmt.Sprintf("Cleared %d queued track(s).", removed), "")
@@ -187,6 +218,8 @@ func (b *Bot) cmdHelp(ctx context.Context) {
 		{p + "pause / " + p + "resume", "pause or resume playback"},
 		{p + "next / " + p + "prev", "move through the queue"},
 		{p + "skip <n>", "jump to queue position n"},
+		{p + "random on|off", "shuffle the queue (off by default)"},
+		{p + "repeat on|off", "loop the queue when it ends"},
 		{p + "clear", "drop everything after the current track"},
 		{p + "stop", "stop playing and empty the queue"},
 	}
@@ -343,6 +376,29 @@ func (b *Bot) resolveTracks(ctx context.Context, cmd Command) ([]jellyfin.Item, 
 		return nil, false
 	}
 	return tracks, true
+}
+
+// cmdToggle handles the on/off settings. With no argument it reports the
+// current state rather than guessing which way to flip it.
+func (b *Bot) cmdToggle(ctx context.Context, cmd Command, label string, current bool, set func(bool)) {
+	if cmd.Rest == "" {
+		b.reply(ctx, fmt.Sprintf("%s is %s.", label, onOff(current)), "")
+		return
+	}
+	on, ok := parseOnOff(cmd.Args[0])
+	if !ok {
+		b.reply(ctx, fmt.Sprintf("Usage: %s%s on|off", b.cfg.Matrix.CommandPrefix, strings.ToLower(label)), "")
+		return
+	}
+	set(on)
+	b.reply(ctx, fmt.Sprintf("%s is now %s.", label, onOff(on)), "")
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 func (b *Bot) cmdSkip(ctx context.Context, cmd Command) {
