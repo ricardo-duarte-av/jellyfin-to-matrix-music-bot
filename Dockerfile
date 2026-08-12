@@ -39,15 +39,20 @@ RUN apk add --no-cache \
         ca-certificates \
         tzdata
 
-# Fail the build rather than the first playback if the encoders are missing.
-RUN ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopus \
-        && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264
-
 COPY --from=build /out/musicbot /usr/local/bin/musicbot
+
+# Fail the build rather than the first playback if anything is missing. This
+# runs the bot's own preflight, which renders a real album art tile, so it
+# checks the encoders, the font lookup and the H.264 output together.
+RUN musicbot -check
 
 # Nothing here needs root.
 RUN adduser -D -u 1000 musicbot
 USER musicbot
+
+# Repeat the check as the unprivileged user, so a permissions problem shows up
+# now rather than on the first track.
+RUN musicbot -check
 
 # The config carries an access token and an API key, so it is mounted rather
 # than baked in: -v ./config.yaml:/config/config.yaml:ro

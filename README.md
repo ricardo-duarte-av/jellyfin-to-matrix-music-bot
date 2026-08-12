@@ -103,6 +103,14 @@ To build it yourself:
 docker build -t musicbot .
 ```
 
+To check an environment can do what the bot needs — ffmpeg, its encoders, and
+the artwork renderer, which is exercised by rendering a real tile:
+
+```sh
+docker run --rm --entrypoint musicbot ghcr.io/ricardo-duarte-av/jellyfin-to-matrix-music-bot:latest -check
+musicbot -check   # or against a local build
+```
+
 ## Commands
 
 | Command | Effect |

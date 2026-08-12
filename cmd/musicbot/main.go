@@ -34,10 +34,21 @@ var (
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	check := flag.Bool("check", false, "check ffmpeg, its encoders and the artwork renderer, then exit")
+	ffmpegPath := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary to use with -check")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("musicbot %s (%s) built %s\n", version, commit, buildTime)
+		return
+	}
+
+	if *check {
+		fmt.Printf("musicbot %s (%s) built %s\n", version, commit, buildTime)
+		if err := preflight(*ffmpegPath); err != nil {
+			fmt.Fprintln(os.Stderr, "preflight failed:", err)
+			os.Exit(1)
+		}
 		return
 	}
 

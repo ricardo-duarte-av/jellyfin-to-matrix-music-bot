@@ -89,6 +89,10 @@ func firstFontUnder(root string) string {
 	return found
 }
 
+// FontFile is the font the placeholder tile will use, or "" when none was
+// found and the tile falls back to a plain square.
+func (r *Renderer) FontFile() string { return r.fontFile }
+
 // FromImage encodes cover art into an H.264 keyframe.
 func (r *Renderer) FromImage(image []byte) ([]byte, error) {
 	filter := fmt.Sprintf(

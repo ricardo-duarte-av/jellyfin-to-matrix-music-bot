@@ -83,14 +83,10 @@ jobs:
 
       # A container that starts but cannot encode is the failure mode worth
       # catching here: the bot only discovers a missing encoder mid-playback.
+      # -check renders a real album art tile, so it exercises the encoders, the
+      # font lookup and the H.264 output, and says which part failed.
       - name: Smoke test the image
         if: github.event_name != 'pull_request'
         run: |
           IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
-          docker run --rm --entrypoint sh "$IMAGE" -c '
-            set -e
-            musicbot -version
-            ffmpeg -hide_banner -encoders | grep -q libopus
-            ffmpeg -hide_banner -encoders | grep -q libx264
-            test -f /usr/share/fonts/ttf-dejavu/DejaVuSans.ttf
-          '
+          docker run --rm --entrypoint musicbot "$IMAGE" -check
