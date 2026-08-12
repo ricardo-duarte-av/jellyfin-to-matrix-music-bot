@@ -361,6 +361,49 @@ func TestRandomPlaysEveryTrackOnce(t *testing.T) {
 	}
 }
 
+// TestRandomStartsOnARandomTrack checks that shuffle applies to the track a
+// batch opens with, not just to what follows it.
+func TestRandomStartsOnARandomTrack(t *testing.T) {
+	requireFFmpeg(t)
+	dir := t.TempDir()
+	tone := makeTone(t, dir, "tone.wav", 5, 440)
+
+	var tracks []jellyfin.Item
+	for _, name := range []string{"A", "B", "C", "D", "E", "F", "G", "H"} {
+		tracks = append(tracks, jellyfin.Item{ID: tone, Kind: jellyfin.KindTrack, Name: name})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		start func(p *Player, items []jellyfin.Item)
+	}{
+		{"PlayNow", func(p *Player, items []jellyfin.Item) { p.PlayNow(items) }},
+		{"Enqueue", func(p *Player, items []jellyfin.Item) { p.Enqueue(items) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPlayer(t, &fakePublisher{})
+			p.SetRandom(true)
+
+			// Eight tracks over eight passes: always opening on the first one
+			// by chance has a probability of 8^-8.
+			seen := map[string]int{}
+			for i := 0; i < len(tracks); i++ {
+				tc.start(p, tracks)
+				if current := p.Status().Current; current != nil {
+					seen[current.Name]++
+				}
+				p.Stop()
+			}
+			if len(seen) == 1 && seen[tracks[0].Name] > 0 {
+				t.Errorf("every pass opened on %s; want the first track shuffled too", tracks[0].Name)
+			}
+			if len(seen) == 0 {
+				t.Error("no track ever started playing")
+			}
+		})
+	}
+}
+
 func TestRepeatLoopsTheQueue(t *testing.T) {
 	requireFFmpeg(t)
 	dir := t.TempDir()

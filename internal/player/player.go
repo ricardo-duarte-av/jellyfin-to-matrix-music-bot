@@ -221,6 +221,7 @@ func (p *Player) do(fn func(*core)) {
 // added and whether the queue limit was hit.
 func (p *Player) Enqueue(items []jellyfin.Item) (added int, truncated bool) {
 	p.do(func(c *core) {
+		start := len(c.queue)
 		for _, item := range items {
 			if len(c.queue) >= p.maxQueue {
 				truncated = true
@@ -230,7 +231,12 @@ func (p *Player) Enqueue(items []jellyfin.Item) (added int, truncated bool) {
 			added++
 		}
 		if c.state == StateIdle && added > 0 {
-			c.startAt(p, c.position)
+			// Starting from idle picks up where the queue left off, but with
+			// random on the opening track is drawn from what was just added.
+			if c.position < start {
+				start = c.position
+			}
+			c.startAt(p, c.pickStart(start, len(c.queue)))
 		}
 	})
 	return added, truncated
@@ -271,7 +277,9 @@ func (p *Player) PlayNow(items []jellyfin.Item) (added int, truncated bool) {
 		// refers to the tracks it was recorded against.
 		c.queue = slices.Insert(c.queue, insertAt, items...)
 		c.played = nil
-		c.startAt(p, insertAt)
+		// Random applies to the first track too, otherwise playing an album
+		// shuffled would always open with track one.
+		c.startAt(p, c.pickStart(insertAt, insertAt+len(items)))
 	})
 	return added, truncated
 }
@@ -515,6 +523,15 @@ func (c *core) nextIndex() int {
 		}
 	}
 	return candidates[rand.IntN(len(candidates))]
+}
+
+// pickStart chooses which entry of the half-open range [from, to) to open a
+// batch of tracks with: the first one normally, a random one when shuffling.
+func (c *core) pickStart(from, to int) int {
+	if !c.random || to-from < 2 {
+		return from
+	}
+	return from + rand.IntN(to-from)
 }
 
 // startAt begins playing queue entry idx, replacing anything already playing.
