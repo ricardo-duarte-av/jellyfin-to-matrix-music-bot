@@ -42,8 +42,8 @@ func NewRenderer(ffmpegPath string) *Renderer {
 // development is usually Debian, so both have to be covered.
 var fontCandidates = []string{
 	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian, Ubuntu
-	"/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf",      // Alpine
-	"/usr/share/fonts/dejavu/DejaVuSans.ttf",          // Fedora, RHEL
+	"/usr/share/fonts/dejavu/DejaVuSans.ttf",          // Alpine, Fedora, RHEL
+	"/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf",      // older Alpine
 	"/usr/share/fonts/TTF/DejaVuSans.ttf",             // Arch
 	"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 	"/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
