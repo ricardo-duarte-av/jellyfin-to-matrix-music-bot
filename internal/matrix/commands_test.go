@@ -406,3 +406,49 @@ func TestAdvertisedCommandsAreHandled(t *testing.T) {
 		}
 	}
 }
+
+// Matrix does not deduplicate state events: re-sending identical content still
+// writes a new event. Without this check the bot would add one event per
+// command to room state on every restart, forever.
+func TestUnchangedDescriptionSkipsRewrites(t *testing.T) {
+	spec := commandSpecs()[0]
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	same := &event.Event{Content: event.Content{VeryRaw: encoded}}
+	if !unchangedDescription(same, spec) {
+		t.Error("identical description reported as changed; it would be rewritten every restart")
+	}
+
+	// Key order and whitespace are not significant.
+	var reordered map[string]any
+	if err := json.Unmarshal(encoded, &reordered); err != nil {
+		t.Fatal(err)
+	}
+	shuffled, err := json.MarshalIndent(reordered, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unchangedDescription(&event.Event{Content: event.Content{VeryRaw: shuffled}}, spec) {
+		t.Error("re-encoded description reported as changed; comparison should be semantic")
+	}
+
+	// A real change must be detected, or edits would never reach clients.
+	edited := spec
+	edited.Description = describe("something else entirely")
+	if unchangedDescription(same, edited) {
+		t.Error("edited description reported as unchanged; clients would keep the old text")
+	}
+
+	for _, missing := range []*event.Event{
+		nil,
+		{Content: event.Content{}},
+		{Content: event.Content{VeryRaw: []byte("{}")}},
+	} {
+		if unchangedDescription(missing, spec) {
+			t.Error("missing or retracted description reported as unchanged; it would never be published")
+		}
+	}
+}

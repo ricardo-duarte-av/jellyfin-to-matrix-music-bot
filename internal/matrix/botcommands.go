@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -172,11 +173,26 @@ func descriptionStateKey(command string, user id.UserID) string {
 // regardless.
 func (b *Bot) advertiseCommands(ctx context.Context) {
 	specs := commandSpecs()
-	current := make(map[string]bool, len(specs))
 
+	// Read the room's existing descriptions first. Matrix does not deduplicate
+	// state events: re-sending identical content still writes a new event, so
+	// advertising unconditionally would add an event per command on every
+	// restart, forever.
+	var existing map[string]*event.Event
+	if state, err := b.client.State(ctx, b.roomID); err != nil {
+		b.client.Log.Warn().Err(err).Msg("could not read existing command descriptions; re-advertising all")
+	} else {
+		existing = state[event.StateMSC4391BotCommand]
+	}
+
+	current := make(map[string]bool, len(specs))
+	published := 0
 	for _, spec := range specs {
 		key := descriptionStateKey(spec.Command, b.client.UserID)
 		current[key] = true
+		if unchangedDescription(existing[key], spec) {
+			continue
+		}
 		if _, err := b.client.SendStateEvent(ctx, b.roomID, event.StateMSC4391BotCommand, key, &spec); err != nil {
 			b.client.Log.Warn().Err(err).Str("command", spec.Command).
 				Msg("could not advertise command; clients will not offer it, text commands still work")
@@ -184,22 +200,42 @@ func (b *Bot) advertiseCommands(ctx context.Context) {
 			// rest will fail the same way.
 			return
 		}
+		published++
 	}
-	b.client.Log.Info().Int("commands", len(specs)).Msg("advertised commands to clients")
+	b.client.Log.Info().
+		Int("commands", len(specs)).
+		Int("published", published).
+		Msg("command descriptions are up to date")
 
-	b.pruneCommandDescriptions(ctx, current)
+	b.pruneCommandDescriptions(ctx, existing, current)
+}
+
+// unchangedDescription reports whether the room already carries this exact
+// description, so it does not need rewriting.
+func unchangedDescription(evt *event.Event, spec commandSpec) bool {
+	if evt == nil || len(evt.Content.VeryRaw) == 0 {
+		return false
+	}
+	want, err := json.Marshal(spec)
+	if err != nil {
+		return false
+	}
+	// Compare decoded, since key order and whitespace are not significant.
+	var have, wanted any
+	if err := json.Unmarshal(evt.Content.VeryRaw, &have); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(want, &wanted); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(have, wanted)
 }
 
 // pruneCommandDescriptions retracts descriptions for commands that no longer
 // exist. State keys hash the command name, so a renamed or removed command
 // leaves an orphan that clients would keep offering.
-func (b *Bot) pruneCommandDescriptions(ctx context.Context, current map[string]bool) {
-	state, err := b.client.State(ctx, b.roomID)
-	if err != nil {
-		b.client.Log.Warn().Err(err).Msg("could not check for stale command descriptions")
-		return
-	}
-	for key, evt := range state[event.StateMSC4391BotCommand] {
+func (b *Bot) pruneCommandDescriptions(ctx context.Context, existing map[string]*event.Event, current map[string]bool) {
+	for key, evt := range existing {
 		if evt == nil || current[key] || evt.Sender != b.client.UserID {
 			continue
 		}
