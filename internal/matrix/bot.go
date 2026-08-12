@@ -95,6 +95,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	// replays that same state, and without this the bot would announce every
 	// existing participant as a fresh arrival on every restart.
 	b.primeCallWatcher(ctx)
+	b.advertiseCommands(ctx)
 
 	return b.client.SyncWithContext(ctx)
 }
@@ -136,7 +137,19 @@ func (b *Bot) handleMessage(ctx context.Context, evt *event.Event) {
 		return
 	}
 	content, ok := evt.Content.Parsed.(*event.MessageEventContent)
-	if !ok || content.MsgType != event.MsgText {
+	if !ok {
+		return
+	}
+
+	// A structured MSC4391 invocation is authoritative: the client already
+	// resolved which command and arguments the user meant, so there is nothing
+	// to parse out of the body.
+	if cmd, ok := structuredCommand(content.MSC4391BotCommand); ok {
+		b.dispatch(ctx, evt, cmd)
+		return
+	}
+
+	if content.MsgType != event.MsgText {
 		return
 	}
 	cmd, ok := ParseCommand(b.cfg.Matrix.CommandPrefix, content.Body)

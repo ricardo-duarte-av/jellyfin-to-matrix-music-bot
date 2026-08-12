@@ -144,6 +144,26 @@ repeats, rather than picking blindly and replaying the same one. With `!repeat`
 on, exhausting the queue starts a fresh pass. Both settings last until the bot
 restarts; either command with no argument reports its current state.
 
+### Structured commands (MSC4391)
+
+The bot implements [MSC4391](https://github.com/matrix-org/matrix-spec-proposals/pull/4391),
+so clients that support it — gomuks does — can offer its commands directly
+instead of requiring the text syntax above.
+
+It publishes an `org.matrix.msc4391.command_description` state event per command
+describing the parameters and their types, and accepts an
+`org.matrix.msc4391.command` content block as an invocation. Structured
+invocations take priority over the message body; typing commands keeps working
+exactly as before.
+
+Both directions come from one table in `internal/matrix/botcommands.go`, so what
+is advertised and what is accepted cannot drift apart. Descriptions are state
+events, so the bot needs permission to send state in the room — without it, it
+logs a warning and carries on with text commands only. Descriptions for commands
+that no longer exist are retracted at startup, since the state key hashes the
+command name and a rename would otherwise leave clients offering a command that
+no longer answers.
+
 `!stop`, `!clear` and `!skip` are limited to `matrix.admins`. Leave that list
 empty to let everyone use them.
 

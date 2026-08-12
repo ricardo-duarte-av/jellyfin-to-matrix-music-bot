@@ -1,10 +1,15 @@
 package matrix
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"maunium.net/go/mautrix/event"
 
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/jellyfin"
 )
@@ -253,5 +258,151 @@ func TestIsEmptyJSONObject(t *testing.T) {
 	}
 	if isEmptyJSONObject([]byte(`{"application":"m.call"}`)) {
 		t.Error("a populated membership was treated as empty")
+	}
+}
+
+// MSC4391 structured invocations must reach exactly the same handlers as typed
+// text, so the two paths cannot drift apart in behaviour.
+func TestStructuredCommandMatchesTypedText(t *testing.T) {
+	tests := []struct {
+		name      string
+		command   string
+		arguments string
+		want      Command
+	}{
+		{
+			name: "no arguments", command: "pause", arguments: "",
+			want: Command{Name: "pause", Args: []string{}, Rest: ""},
+		},
+		{
+			name: "search with kind", command: "search",
+			arguments: `{"kind":"album","query":"dark side of the moon"}`,
+			want:      Command{Name: "search", Args: []string{"album", "dark", "side", "of", "the", "moon"}, Rest: "album dark side of the moon"},
+		},
+		{
+			name: "search without the optional kind", command: "search",
+			arguments: `{"query":"mario"}`,
+			want:      Command{Name: "search", Args: []string{"mario"}, Rest: "mario"},
+		},
+		{
+			name: "play by result numbers", command: "play",
+			arguments: `{"selection":[3,1,2]}`,
+			want:      Command{Name: "play", Args: []string{"3", "1", "2"}, Rest: "3 1 2"},
+		},
+		{
+			name: "play by query", command: "play",
+			arguments: `{"selection":["ocarina","of","time"]}`,
+			want:      Command{Name: "play", Args: []string{"ocarina", "of", "time"}, Rest: "ocarina of time"},
+		},
+		{
+			name: "integer argument", command: "skip",
+			arguments: `{"position":7}`,
+			want:      Command{Name: "skip", Args: []string{"7"}, Rest: "7"},
+		},
+		{
+			name: "boolean becomes on", command: "random",
+			arguments: `{"enabled":true}`,
+			want:      Command{Name: "random", Args: []string{"on"}, Rest: "on"},
+		},
+		{
+			name: "boolean becomes off", command: "repeat",
+			arguments: `{"enabled":false}`,
+			want:      Command{Name: "repeat", Args: []string{"off"}, Rest: "off"},
+		},
+		{
+			name: "omitted optional reports state", command: "random", arguments: "{}",
+			want: Command{Name: "random", Args: []string{}, Rest: ""},
+		},
+		{
+			name: "aliases resolve", command: "np", arguments: "",
+			want: Command{Name: "nowplaying", Args: []string{}, Rest: ""},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := &event.MSC4391BotCommandInput{Command: tc.command}
+			if tc.arguments != "" {
+				input.Arguments = json.RawMessage(tc.arguments)
+			}
+			got, ok := structuredCommand(input)
+			if !ok {
+				t.Fatalf("structuredCommand(%q) was rejected", tc.command)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("structuredCommand() = %+v; want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStructuredCommandRejectsJunk(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input *event.MSC4391BotCommandInput
+	}{
+		{"nil", nil},
+		{"empty command", &event.MSC4391BotCommandInput{}},
+		{"unknown command", &event.MSC4391BotCommandInput{Command: "selfdestruct"}},
+		{"malformed arguments", &event.MSC4391BotCommandInput{
+			Command: "search", Arguments: json.RawMessage(`["not","an","object"]`)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := structuredCommand(tc.input); ok {
+				t.Error("structuredCommand() accepted it; want rejected so the text path can try")
+			}
+		})
+	}
+}
+
+// The state key is what stops two bots' descriptions colliding, so it has to be
+// exactly what the MSC specifies: padded base64 of sha256(command + mxid).
+func TestDescriptionStateKey(t *testing.T) {
+	sum := sha256.Sum256([]byte("play@jellybot:example.org"))
+	want := base64.StdEncoding.EncodeToString(sum[:])
+
+	got := descriptionStateKey("play", "@jellybot:example.org")
+	if got != want {
+		t.Errorf("descriptionStateKey() = %q; want %q", got, want)
+	}
+	if strings.HasSuffix(got, "=") == false && len(got) != 44 {
+		t.Errorf("state key %q does not look like padded base64", got)
+	}
+
+	// Different bots and different commands must not collide.
+	if descriptionStateKey("play", "@other:example.org") == got {
+		t.Error("state key ignores the bot's user ID")
+	}
+	if descriptionStateKey("stop", "@jellybot:example.org") == got {
+		t.Error("state key ignores the command name")
+	}
+}
+
+// Every advertised command must be one dispatch actually handles, or clients
+// would offer commands that answer "unknown command".
+func TestAdvertisedCommandsAreHandled(t *testing.T) {
+	handled := map[string]bool{
+		"help": true, "search": true, "list": true, "play": true, "queue": true,
+		"nowplaying": true, "pause": true, "resume": true, "next": true,
+		"prev": true, "skip": true, "random": true, "repeat": true,
+		"clear": true, "stop": true,
+	}
+	for _, spec := range commandSpecs() {
+		if !handled[spec.Command] {
+			t.Errorf("advertised command %q is not handled by dispatch", spec.Command)
+		}
+		if canonicalName(spec.Command) != spec.Command {
+			t.Errorf("advertised command %q is an alias; advertise the canonical name", spec.Command)
+		}
+		if spec.Description.Text[0].Body == "" {
+			t.Errorf("command %q has no description", spec.Command)
+		}
+		seen := map[string]bool{}
+		for _, param := range spec.Parameters {
+			if seen[param.Key] {
+				t.Errorf("command %q has duplicate parameter %q; the MSC says clients must hide it", spec.Command, param.Key)
+			}
+			seen[param.Key] = true
+		}
 	}
 }
