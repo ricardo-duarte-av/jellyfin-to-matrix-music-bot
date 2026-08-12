@@ -183,6 +183,32 @@ Someone in the call from several devices holds one membership per device, and
 all of them are retracted. The bot needs enough power to redact other people's
 events, which is power level 50 by default.
 
+## Playback reporting
+
+The bot reports what it is playing back to Jellyfin, so it appears under
+Dashboard → Now Playing like any other client, with the current track and
+position. It sends a start when a track begins, progress every ten seconds and
+whenever it is paused or resumed, and a stop when the track ends — including on
+shutdown, so it does not linger in the now-playing list. Reporting failures are
+logged and never interrupt playback.
+
+A track that reaches 90% of its runtime is also marked played for
+`jellyfin.user_id`, which is what drives play counts, last-played dates and
+"recently played" mixes. Skipping earlier deliberately does not count.
+
+Two details are worth knowing. Jellyfin opens the session from the `Client`,
+`Device`, `DeviceId` and `Version` fields of the authorization header, so the
+bot sends them; the device ID is derived from the server URL and user, which
+keeps it stable across restarts so a restarted bot resumes its own session
+instead of accumulating dead ones. The session itself is named after the API
+key, because Jellyfin overrides the client name with the key's name for API-key
+authentication — name the key something recognisable.
+
+Play counts need the separate mark-played call because an API key authenticates
+as the server with no user attached: session reports credit the user behind the
+session, and there isn't one, so on their own they would never reach a play
+count.
+
 The bot also announces people joining and leaving the call, with their name as a
 pill. Participants already present when it starts are not announced, and someone
 in the call from several devices is only reported as leaving once the last of

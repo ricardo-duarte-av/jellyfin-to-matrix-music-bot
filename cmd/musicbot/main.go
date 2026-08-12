@@ -214,6 +214,10 @@ func run(configPath string) error {
 				bot.TrackChanged(item)
 			}
 		},
+		// Tell Jellyfin what is playing, so the bot shows up in the dashboard
+		// like any other client and listens count towards play counts.
+		Reporter:         jellyfin.NewPlaybackReporter(jf, log),
+		ProgressInterval: jellyfin.ProgressInterval,
 	})
 	defer plr.Close()
 

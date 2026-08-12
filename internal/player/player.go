@@ -48,6 +48,8 @@ type Player struct {
 	encode     EncodeOptions
 	// urlFor resolves a library item to something ffmpeg can read.
 	urlFor func(jellyfin.Item) string
+	// progressInterval paces the reporter's progress updates.
+	progressInterval time.Duration
 
 	// notices carries playback events (track changes, failures) out to the
 	// chat. It is buffered and drained by its own goroutine so that a slow
@@ -55,6 +57,12 @@ type Player struct {
 	notices chan string
 	// changes carries track-change notifications to the TrackChanged callback.
 	changes chan *jellyfin.Item
+	// reports carries playback lifecycle events to the Reporter. It is nil when
+	// no reporter was configured.
+	reports chan report
+	// reportsDone closes once every queued report has been delivered, so a
+	// shutdown can wait for the final stop to reach the server.
+	reportsDone chan struct{}
 
 	cmds chan func(*core)
 	stop chan struct{}
@@ -85,6 +93,9 @@ type core struct {
 	// announced is what the last track-change callback reported, so the run
 	// loop can emit one event per actual change.
 	announced string
+	// rep is what the reporter has been told, tracked separately from announced
+	// because it has to survive the track being torn down.
+	rep reportState
 	// advance carries the reason the current track ended.
 	skipTo int
 }
@@ -107,22 +118,37 @@ type Options struct {
 	// moves, and with nil when playback stops. It gets the item rather than a
 	// formatted string so callers can use its artwork. Optional.
 	TrackChanged func(*jellyfin.Item)
+	// Reporter receives playback lifecycle events for the library server, so it
+	// can show what the bot is playing and record plays. Optional.
+	Reporter Reporter
+	// ProgressInterval is how often the Reporter is given a progress update.
+	// Defaults to defaultProgressInterval.
+	ProgressInterval time.Duration
 }
+
+// defaultProgressInterval matches what media servers expect from a client:
+// often enough that the session does not go stale, rarely enough to be free.
+const defaultProgressInterval = 10 * time.Second
 
 // New creates a player from opts and starts its run loop.
 func New(opts Options) *Player {
+	progressInterval := opts.ProgressInterval
+	if progressInterval <= 0 {
+		progressInterval = defaultProgressInterval
+	}
 	p := &Player{
-		pub:        opts.Publisher,
-		ffmpegPath: opts.FFmpegPath,
-		maxQueue:   opts.MaxQueue,
-		encode:     opts.Encode,
-		urlFor:     opts.URLFor,
-		notices:    make(chan string, 32),
-		changes:    make(chan *jellyfin.Item, 8),
-		cmds:       make(chan func(*core), 16),
-		stop:       make(chan struct{}),
-		done:       make(chan struct{}),
-		status:     Status{State: StateIdle},
+		pub:              opts.Publisher,
+		ffmpegPath:       opts.FFmpegPath,
+		maxQueue:         opts.MaxQueue,
+		encode:           opts.Encode,
+		urlFor:           opts.URLFor,
+		progressInterval: progressInterval,
+		notices:          make(chan string, 32),
+		changes:          make(chan *jellyfin.Item, 8),
+		cmds:             make(chan func(*core), 16),
+		stop:             make(chan struct{}),
+		done:             make(chan struct{}),
+		status:           Status{State: StateIdle},
 	}
 	go p.run()
 	// Both callbacks run on their own goroutines: they reach the network, and
@@ -141,6 +167,23 @@ func New(opts Options) *Player {
 			}
 		}
 	}()
+	if opts.Reporter != nil {
+		p.reports = make(chan report, 32)
+		p.reportsDone = make(chan struct{})
+		go func() {
+			defer close(p.reportsDone)
+			for r := range p.reports {
+				switch r.kind {
+				case reportStarted:
+					opts.Reporter.Started(r.item, r.elapsed)
+				case reportProgress:
+					opts.Reporter.Progress(r.item, r.elapsed, r.paused)
+				case reportStopped:
+					opts.Reporter.Stopped(r.item, r.elapsed)
+				}
+			}
+		}()
+	}
 	return p
 }
 
@@ -189,6 +232,13 @@ func (p *Player) Close() {
 	<-p.done
 	close(p.notices)
 	close(p.changes)
+	if p.reports != nil {
+		// The run loop has already queued a stop for whatever was playing. Wait
+		// for it to reach the server rather than exiting with the bot still
+		// listed as playing.
+		close(p.reports)
+		<-p.reportsDone
+	}
 }
 
 // Status returns the current playback status.
@@ -406,6 +456,12 @@ func (p *Player) run() {
 	// 0.6% for the whole container sitting in a call with nothing playing.
 	ticker := time.NewTicker(rtc.FrameDuration)
 	defer ticker.Stop()
+
+	// Progress updates are cheap and paced independently of the audio, so they
+	// keep running while paused: that is what tells the server the session is
+	// still alive rather than abandoned.
+	progress := time.NewTicker(p.progressInterval)
+	defer progress.Stop()
 	ticking := true
 	pace := func() {
 		want := c.state == StatePlaying && c.stream != nil
@@ -424,11 +480,13 @@ func (p *Player) run() {
 	for {
 		select {
 		case <-p.stop:
+			p.finalReport(c)
 			return
 		case fn := <-p.cmds:
 			fn(c)
 			p.publishStatus(c)
 			p.syncTrack(c)
+			p.syncReport(c)
 			pace()
 		case <-ticker.C:
 			if c.state != StatePlaying || c.stream == nil {
@@ -437,8 +495,11 @@ func (p *Player) run() {
 			}
 			p.pump(c)
 			p.syncTrack(c)
+			p.syncReport(c)
 			// pump can end a track, which stops the stream.
 			pace()
+		case <-progress.C:
+			p.tickReport(c)
 		}
 	}
 }

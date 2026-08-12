@@ -5,6 +5,8 @@ package jellyfin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -124,11 +126,20 @@ type Client struct {
 	userID string
 }
 
+// clientName is how the bot identifies itself to Jellyfin. Device and DeviceId
+// go with it: playback reporting is session-based, and Jellyfin opens a session
+// from these header fields. Without a device ID it substitutes the server's own,
+// so every API-key client would share one session and overwrite each other's
+// "now playing".
+const clientName = "Jellyfin-to-Matrix"
+
 // New builds a Jellyfin client. server must include scheme and port.
 func New(server, apiKey, userID string) *Client {
 	cfg := &api.Configuration{
-		Servers:       api.ServerConfigurations{{URL: server}},
-		DefaultHeader: map[string]string{"Authorization": fmt.Sprintf(`MediaBrowser Token="%s"`, apiKey)},
+		Servers: api.ServerConfigurations{{URL: server}},
+		DefaultHeader: map[string]string{
+			"Authorization": authHeader(apiKey, deviceID(server, userID)),
+		},
 	}
 	return &Client{
 		api:    api.NewAPIClient(cfg),
@@ -137,6 +148,25 @@ func New(server, apiKey, userID string) *Client {
 		apiKey: apiKey,
 		userID: userID,
 	}
+}
+
+// authHeader builds the MediaBrowser authorization header. Jellyfin parses the
+// device fields out of it to open a session; only Token carries credentials.
+func authHeader(apiKey, device string) string {
+	return fmt.Sprintf(`MediaBrowser Client="%s", Device="%s", DeviceId="%s", Version="%s", Token="%s"`,
+		clientName, clientName, device, version, apiKey)
+}
+
+// version is reported to Jellyfin as the client version.
+const version = "1.0.0"
+
+// deviceID derives a device identifier that survives restarts, so a restarted
+// bot resumes its own session instead of leaving a dead one behind and opening
+// a second. It is derived rather than configured because it only has to be
+// stable and unique per bot instance, and server plus user already are.
+func deviceID(server, userID string) string {
+	sum := sha256.Sum256([]byte(clientName + server + userID))
+	return hex.EncodeToString(sum[:8])
 }
 
 // Ping verifies the server is reachable and the credentials work. It also
