@@ -118,12 +118,17 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 
 	switch change {
 	case callJoined:
+		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("joined the call")
 		b.announcePresence(ctx, evt.Sender, "joined")
 	case callLeft:
 		// Someone in the call from two devices who closes one has not left.
 		if b.calls.stillPresent(evt.Sender) {
+			b.client.Log.Info().
+				Str("user_id", evt.Sender.String()).
+				Msg("left the call from one device, still present on another")
 			return
 		}
+		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("left the call")
 		b.announcePresence(ctx, evt.Sender, "left")
 	}
 }

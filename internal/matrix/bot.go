@@ -57,8 +57,13 @@ func (b *Bot) TrackChanged(item *jellyfin.Item) {
 		b.art.Show(item)
 	}
 	if item == nil {
+		b.client.Log.Info().Msg("playback stopped")
 		return
 	}
+	b.client.Log.Info().
+		Str("item_id", item.ID).
+		Str("track", item.Describe()).
+		Msg("now playing")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	b.sendNowPlaying(ctx, *item, "Now playing: "+item.Describe())
@@ -126,6 +131,7 @@ func (b *Bot) primeCallWatcher(ctx context.Context) {
 
 // Notify posts a message to the streaming room. It is the player's callback.
 func (b *Bot) Notify(msg string) {
+	b.client.Log.Info().Str("notice", msg).Msg("playback event")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b.send(ctx, msg, "")
@@ -172,10 +178,21 @@ var controlCommands = map[string]bool{
 
 func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 	name := canonicalName(cmd.Name)
+	// One line per command, so the log shows who asked the bot to do what. The
+	// raw name goes alongside the canonical one because an unknown command only
+	// exists as what the user typed.
+	log := b.client.Log.With().
+		Str("sender", evt.Sender.String()).
+		Str("command", name).
+		Str("typed", cmd.Name).
+		Strs("args", cmd.Args).
+		Logger()
 	if controlCommands[name] && !b.cfg.IsAdmin(evt.Sender.String()) {
+		log.Info().Msg("command refused: admin only")
 		b.reply(ctx, fmt.Sprintf("Sorry, %s is limited to admins.", b.cfg.Matrix.CommandPrefix+name), "")
 		return
 	}
+	log.Info().Msg("command")
 
 	switch name {
 	case "help":
