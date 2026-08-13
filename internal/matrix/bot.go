@@ -251,8 +251,8 @@ func (b *Bot) cmdHelp(ctx context.Context) {
 	lines := [][2]string{
 		{p + "search [artist|album|track|playlist] <query>", "search the library; results are numbered"},
 		{p + "list", "show the last search results again"},
-		{p + "play <n> [n ...]", "play results by number right away"},
-		{p + "play <query>", "search and play the best match right away"},
+		{p + "play <n> [n ...]", "replace the queue with results by number and play"},
+		{p + "play <query>", "replace the queue with the best match and play"},
 		{p + "queue <n> | <query>", "add to the end of the queue instead"},
 		{p + "queue", "show the queue"},
 		{p + "nowplaying", "show the current track"},
@@ -314,8 +314,8 @@ func (b *Bot) cmdList(ctx context.Context) {
 	b.replyResults(ctx, "Last search results", items)
 }
 
-// cmdPlay starts playing the requested items right away. Anything already
-// queued still plays afterwards.
+// cmdPlay replaces the queue with the requested items and starts playing them
+// right away. Use queue to add to what is already lined up.
 func (b *Bot) cmdPlay(ctx context.Context, cmd Command) {
 	if cmd.Rest == "" {
 		b.reply(ctx, "Usage: "+b.cfg.Matrix.CommandPrefix+"play <number> or "+b.cfg.Matrix.CommandPrefix+"play <query>", "")

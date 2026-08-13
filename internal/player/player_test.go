@@ -245,10 +245,10 @@ func TestUnplayableTrackIsSkipped(t *testing.T) {
 	}
 }
 
-// TestPlayNowInterruptsAndKeepsQueue pins down the difference between the two
-// commands: !play jumps straight to the new selection, while what was already
-// queued survives and plays afterwards.
-func TestPlayNowInterruptsAndKeepsQueue(t *testing.T) {
+// TestPlayNowReplacesQueue pins down the difference between the two commands:
+// !play throws the old queue away and plays only the new selection, while
+// !queue appends to what is already there.
+func TestPlayNowReplacesQueue(t *testing.T) {
 	requireFFmpeg(t)
 	dir := t.TempDir()
 	tone := makeTone(t, dir, "tone.wav", 5, 440)
@@ -279,9 +279,12 @@ func TestPlayNowInterruptsAndKeepsQueue(t *testing.T) {
 	for _, queued := range status.Queue {
 		names = append(names, queued.Name)
 	}
-	want := []string{"A", "X", "Y", "B"}
+	want := []string{"X", "Y"}
 	if !reflect.DeepEqual(names, want) {
-		t.Errorf("queue = %v; want %v — the new items go after the current track, and B is kept", names, want)
+		t.Errorf("queue = %v; want %v — the new items replace the queue, A and B are gone", names, want)
+	}
+	if status.Position != 0 {
+		t.Errorf("position = %d; want 0", status.Position)
 	}
 }
 
@@ -314,11 +317,19 @@ func TestQueueLimit(t *testing.T) {
 	defer p.Close()
 
 	// Every item here fails to open, which is fine: we only assert the limit.
-	added, truncated := p.Enqueue([]jellyfin.Item{
+	items := []jellyfin.Item{
 		{ID: "1", Kind: jellyfin.KindTrack}, {ID: "2", Kind: jellyfin.KindTrack}, {ID: "3", Kind: jellyfin.KindTrack},
-	})
+	}
+	added, truncated := p.Enqueue(items)
 	if added != 2 || !truncated {
 		t.Errorf("Enqueue() = %d, %v; want 2, true", added, truncated)
+	}
+
+	// PlayNow clears the queue first, so the limit applies to its own items
+	// rather than to whatever room was left over.
+	added, truncated = p.PlayNow(items)
+	if added != 2 || !truncated {
+		t.Errorf("PlayNow() = %d, %v; want 2, true", added, truncated)
 	}
 }
 

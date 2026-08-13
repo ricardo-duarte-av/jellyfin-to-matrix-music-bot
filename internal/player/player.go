@@ -292,44 +292,31 @@ func (p *Player) Enqueue(items []jellyfin.Item) (added int, truncated bool) {
 	return added, truncated
 }
 
-// PlayNow starts playing items immediately, interrupting whatever is playing.
+// PlayNow replaces the queue with items and starts playing them immediately,
+// interrupting whatever is playing.
 //
-// The items are inserted directly after the current track rather than
-// replacing the queue, so anything already lined up still plays afterwards.
-// Use Stop or Clear to actually discard a queue.
+// Discarding the old queue is the point: a !play is the user saying "this is
+// what I want to hear now", and leaving the previous selection lined up behind
+// it produces a queue nobody asked for. Enqueue is the additive command.
 func (p *Player) PlayNow(items []jellyfin.Item) (added int, truncated bool) {
 	p.do(func(c *core) {
-		insertAt := c.position
-		if c.state != StateIdle {
-			insertAt++
-		}
-		if insertAt > len(c.queue) {
-			insertAt = len(c.queue)
-		}
-		if insertAt < 0 {
-			insertAt = 0
-		}
-
-		room := p.maxQueue - len(c.queue)
-		if room < len(items) {
+		if len(items) > p.maxQueue {
 			truncated = true
-			if room < 0 {
-				room = 0
-			}
-			items = items[:room]
+			items = items[:p.maxQueue]
 		}
 		if len(items) == 0 {
 			return
 		}
 		added = len(items)
 
-		// Inserting shifts every later index, so the shuffle bag no longer
-		// refers to the tracks it was recorded against.
-		c.queue = slices.Insert(c.queue, insertAt, items...)
+		// The shuffle bag is recorded against queue indices, which mean
+		// nothing once the queue is replaced.
+		c.queue = slices.Clone(items)
+		c.position = 0
 		c.played = nil
 		// Random applies to the first track too, otherwise playing an album
 		// shuffled would always open with track one.
-		c.startAt(p, c.pickStart(insertAt, insertAt+len(items)))
+		c.startAt(p, c.pickStart(0, len(c.queue)))
 	})
 	return added, truncated
 }

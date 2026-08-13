@@ -117,8 +117,8 @@ musicbot -check   # or against a local build
 | --- | --- |
 | `!search [artist\|album\|track\|playlist] <query>` | search the library; results are numbered |
 | `!list` | show the last search results again |
-| `!play <n> [n ...]` | play results by number **right away** |
-| `!play <query>` | search and play the best match right away |
+| `!play <n> [n ...]` | **replace** the queue with results by number and play |
+| `!play <query>` | search, then replace the queue with the best match and play |
 | `!queue <n> \| <query>` | add to the end of the queue instead |
 | `!queue` | show the queue |
 | `!nowplaying` | show the current track and elapsed time |
@@ -131,10 +131,10 @@ musicbot -check   # or against a local build
 | `!stop` | stop and empty the queue |
 | `!eject <@user:server>` | remove someone from the call |
 
-`!play` interrupts whatever is playing and starts the new selection at once. It
-does not throw away the queue: the new tracks are inserted after the current one,
-so anything already lined up still plays afterwards. Use `!queue` to add to the
-end without interrupting, and `!clear` or `!stop` to actually discard a queue.
+`!play` discards the queue and replaces it with the new selection, which starts
+at once — it is the user saying "this is what I want to hear now", so nothing of
+the previous selection is left lined up behind it. Use `!queue` to add to the end
+without interrupting.
 
 Playing an artist, album or playlist expands it into its tracks. Search results
 expire after `player.result_ttl`, so a stale number cannot play the wrong thing

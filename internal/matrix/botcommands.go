@@ -106,7 +106,7 @@ func commandSpecs() []commandSpec {
 		},
 		{
 			Command:     "play",
-			Description: describe("Play something now, interrupting the current track"),
+			Description: describe("Replace the queue with this and start playing it now"),
 			Parameters: []paramSpec{
 				{Key: "selection", Schema: selection,
 					Description: describe("Result numbers from the last search, or a search query")},
