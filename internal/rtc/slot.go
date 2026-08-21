@@ -2,9 +2,7 @@ package rtc
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -62,7 +60,7 @@ func EnsureSlot(ctx context.Context, client *mautrix.Client, roomID id.RoomID, s
 	case err == nil && existing.IsOpenCall():
 		client.Log.Debug().Str("slot_id", slotID).Msg("MatrixRTC slot already open")
 		return nil
-	case err != nil && !isStateNotFound(err):
+	case err != nil && !isNotFound(err):
 		return fmt.Errorf("read MatrixRTC slot %q: %w", slotID, err)
 	}
 
@@ -75,17 +73,4 @@ func EnsureSlot(ctx context.Context, client *mautrix.Client, roomID id.RoomID, s
 	}
 	client.Log.Info().Str("slot_id", slotID).Msg("opened MatrixRTC slot")
 	return nil
-}
-
-// isStateNotFound reports whether err is the homeserver saying the state event
-// simply is not there, as opposed to something having gone wrong.
-func isStateNotFound(err error) bool {
-	var httpErr mautrix.HTTPError
-	if !errors.As(err, &httpErr) {
-		return false
-	}
-	if httpErr.RespError != nil && httpErr.RespError.ErrCode == mautrix.MNotFound.ErrCode {
-		return true
-	}
-	return httpErr.Response != nil && httpErr.Response.StatusCode == http.StatusNotFound
 }

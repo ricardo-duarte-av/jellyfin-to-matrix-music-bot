@@ -38,10 +38,14 @@ const (
 	// It exists only to clean up after failed delayed events.
 	membershipExpiry = 4 * time.Hour
 	// delayedLeaveTimeout is how long the homeserver waits after our last
-	// keepalive before publishing our leave event.
-	delayedLeaveTimeout = 8 * time.Second
-	// delayedLeaveRefresh must be comfortably shorter than the timeout.
-	delayedLeaveRefresh = 5 * time.Second
+	// keepalive before publishing our leave event. MSC4143 suggests 15-30s for
+	// this dead man's switch.
+	delayedLeaveTimeout = 30 * time.Second
+	// delayedLeaveRefresh must be comfortably shorter than the timeout. A third
+	// of it gives three chances to make the deadline: at one refresh per
+	// timeout minus a hair, a single slow round trip is enough for the
+	// homeserver to decide the bot has died and publish its leave.
+	delayedLeaveRefresh = 10 * time.Second
 )
 
 // SessionMembership is the content of a session-style m.call.member event.
@@ -71,6 +75,10 @@ type Membership struct {
 	delayID id.DelayID
 	joined  bool
 	keeper  *delayKeeper
+	// content is what was published, kept so the membership can be restored if
+	// the delayed leave fires by accident. It is re-sent verbatim: created_ts
+	// decides focus ordering, so a fresh one would reshuffle the call.
+	content *SessionMembership
 }
 
 // NewMembership builds a membership manager for the bot's own identity.
@@ -188,9 +196,10 @@ func (m *Membership) Join(ctx context.Context, transport Transport) error {
 		return fmt.Errorf("send call membership: %w", err)
 	}
 	m.joined = true
+	m.content = &content
 
 	if m.delayID != "" {
-		m.keeper = startDelayKeeper(m.client, m.delayID, delayedLeaveRefresh)
+		m.keeper = startDelayKeeper(m.client, "legacy", m.delayID, delayedLeaveRefresh, m.recover)
 	}
 	return nil
 }
@@ -198,31 +207,70 @@ func (m *Membership) Join(ctx context.Context, transport Transport) error {
 // Leave retracts the membership and cancels the pending delayed leave.
 func (m *Membership) Leave(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.joined {
+		m.mu.Unlock()
 		return nil
 	}
-	m.keeper.Stop()
+	m.joined = false
+	keeper := m.keeper
 	m.keeper = nil
-	if m.delayID != "" {
+	m.mu.Unlock()
+
+	// Stop the keeper without holding the lock: it re-arms through recover,
+	// which takes that same lock, and waiting for it here while holding it
+	// would deadlock.
+	keeper.Stop()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if delayID := latestDelayID(keeper, m.delayID); delayID != "" {
 		// Let the scheduled leave fire now rather than cancelling it: that is
 		// exactly the event we want published.
 		_, err := m.client.UpdateDelayedEvent(ctx, &mautrix.ReqUpdateDelayedEvent{
-			DelayID: m.delayID,
+			DelayID: delayID,
 			Action:  event.DelayActionSend,
 		})
 		m.delayID = ""
-		m.joined = false
 		if err == nil {
 			return nil
 		}
 		m.client.Log.Warn().Err(err).Msg("could not trigger delayed leave; sending empty membership directly")
 	}
-	m.joined = false
 	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, struct{}{}); err != nil {
 		return fmt.Errorf("retract call membership: %w", err)
 	}
 	return nil
+}
+
+// recover re-publishes the membership and arms a new delayed leave, after the
+// old one went missing.
+//
+// A vanished delayed leave nearly always means the homeserver published it, and
+// for this stack that is unrecoverable on its own: unlike sticky membership
+// there is no refresh loop to put things right, so the bot would sit outside the
+// call, still streaming, until someone restarted it.
+func (m *Membership) recover(ctx context.Context) (id.DelayID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.joined || m.content == nil {
+		return "", fmt.Errorf("not joined")
+	}
+	if err := m.armDelayedLeaveLocked(ctx); err != nil {
+		return "", err
+	}
+	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, m.content); err != nil {
+		return "", fmt.Errorf("re-send call membership: %w", err)
+	}
+	return m.delayID, nil
+}
+
+// latestDelayID prefers the keeper's ID, which is the one that survives a
+// re-arm, and falls back to the one armed before the keeper existed.
+func latestDelayID(keeper *delayKeeper, armed id.DelayID) id.DelayID {
+	if delayID := keeper.DelayID(); delayID != "" {
+		return delayID
+	}
+	return armed
 }
 
 // armDelayedLeaveLocked schedules an empty membership event that the homeserver

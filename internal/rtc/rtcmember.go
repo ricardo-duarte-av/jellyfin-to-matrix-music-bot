@@ -159,7 +159,7 @@ func (m *StickyMembership) Join(ctx context.Context) error {
 	m.joined = true
 
 	if m.delayID != "" {
-		m.keeper = startDelayKeeper(m.client, m.delayID, delayedLeaveRefresh)
+		m.keeper = startDelayKeeper(m.client, "sticky", m.delayID, delayedLeaveRefresh, m.recover)
 	}
 	m.stopRe, m.reDone = make(chan struct{}), make(chan struct{})
 	go m.refresh(m.stopRe, m.reDone)
@@ -169,24 +169,30 @@ func (m *StickyMembership) Join(ctx context.Context) error {
 // Leave retracts the membership and cancels the pending delayed leave.
 func (m *StickyMembership) Leave(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !m.joined {
+		m.mu.Unlock()
 		return nil
 	}
-	if m.stopRe != nil {
-		close(m.stopRe)
-		<-m.reDone
-		m.stopRe, m.reDone = nil, nil
-	}
-	m.keeper.Stop()
-	m.keeper = nil
 	m.joined = false
+	keeper, stopRe, reDone := m.keeper, m.stopRe, m.reDone
+	m.keeper, m.stopRe, m.reDone = nil, nil, nil
+	m.mu.Unlock()
 
-	if m.delayID != "" {
+	// Stop the background loops without holding the lock. Both of them take it,
+	// and waiting for them here while holding it would deadlock.
+	if stopRe != nil {
+		close(stopRe)
+		<-reDone
+	}
+	keeper.Stop()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if delayID := latestDelayID(keeper, m.delayID); delayID != "" {
 		// Fire the scheduled leave rather than cancelling it: that is exactly
 		// the event we want published.
 		_, err := m.client.UpdateDelayedEvent(ctx, &mautrix.ReqUpdateDelayedEvent{
-			DelayID: m.delayID,
+			DelayID: delayID,
 			Action:  event.DelayActionSend,
 		})
 		m.delayID = ""
@@ -199,6 +205,28 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 		return fmt.Errorf("retract sticky call membership: %w", err)
 	}
 	return nil
+}
+
+// recover re-publishes the membership and arms a new delayed leave, after the
+// old one went missing.
+//
+// The refresh loop would eventually put the membership back on its own, but not
+// for minutes; a delayed leave that fired by accident has already told every
+// client in the room that the bot left, and it is still streaming to them. This
+// closes that window in seconds instead.
+func (m *StickyMembership) recover(ctx context.Context) (id.DelayID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.joined {
+		return "", fmt.Errorf("not joined")
+	}
+	if err := m.armDelayedLeaveLocked(ctx); err != nil {
+		return "", err
+	}
+	if err := m.sendLocked(ctx, m.joinContent()); err != nil {
+		return "", fmt.Errorf("re-send sticky call membership: %w", err)
+	}
+	return m.delayID, nil
 }
 
 // joinContent is the membership the bot publishes while it is in the call.

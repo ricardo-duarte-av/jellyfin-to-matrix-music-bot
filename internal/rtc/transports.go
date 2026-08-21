@@ -2,7 +2,6 @@ package rtc
 
 import (
 	"context"
-	"errors"
 	"net/http"
 
 	"maunium.net/go/mautrix"
@@ -49,22 +48,4 @@ func HomeserverHasLiveKitTransport(ctx context.Context, client *mautrix.Client) 
 		return false, nil
 	}
 	return false, lastErr
-}
-
-// isEndpointMissing reports whether err is the homeserver saying it does not
-// implement this endpoint, which is the only error worth falling through on.
-func isEndpointMissing(err error) bool {
-	var httpErr mautrix.HTTPError
-	if !errors.As(err, &httpErr) {
-		return false
-	}
-	if httpErr.RespError != nil {
-		switch httpErr.RespError.ErrCode {
-		case mautrix.MUnrecognized.ErrCode, mautrix.MNotFound.ErrCode:
-			return true
-		default:
-			return false
-		}
-	}
-	return httpErr.Response != nil && httpErr.Response.StatusCode == http.StatusNotFound
 }
