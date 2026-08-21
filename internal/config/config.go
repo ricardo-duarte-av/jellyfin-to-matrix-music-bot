@@ -82,7 +82,34 @@ type RTC struct {
 	// authorization service when set.
 	LiveKitServiceURL string `yaml:"livekit_service_url"`
 	DisplayName       string `yaml:"display_name"`
+	// Stack selects which MatrixRTC dialect the bot speaks: "legacy" for the
+	// session-style membership Element Call has always used, "sticky" for the
+	// MSC4143/MSC4354 membership replacing it, or "both".
+	//
+	// "both" costs a second SFU connection, and so doubles the bot's upstream
+	// bandwidth: the two dialects derive different LiveKit identities, and one
+	// connection can only be one of them.
+	Stack string `yaml:"stack"`
+	// StickyDuration is how long a published sticky membership stays valid
+	// without a refresh. Capped at an hour by MSC4354.
+	StickyDuration time.Duration `yaml:"sticky_duration"`
+	// SlotID is the MatrixRTC slot to join. The default is the room-wide call
+	// every calling client uses.
+	SlotID string `yaml:"slot_id"`
 }
+
+// MatrixRTC stack selections.
+const (
+	StackLegacy = "legacy"
+	StackSticky = "sticky"
+	StackBoth   = "both"
+)
+
+// UsesLegacy reports whether the session-style membership should be published.
+func (r RTC) UsesLegacy() bool { return r.Stack == StackLegacy || r.Stack == StackBoth }
+
+// UsesSticky reports whether the MSC4143 membership should be published.
+func (r RTC) UsesSticky() bool { return r.Stack == StackSticky || r.Stack == StackBoth }
 
 // Jellyfin holds the media server connection details.
 type Jellyfin struct {
@@ -128,6 +155,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RTC.DisplayName == "" {
 		c.RTC.DisplayName = "Jukebox"
+	}
+	if c.RTC.Stack == "" {
+		c.RTC.Stack = StackBoth
+	}
+	if c.RTC.StickyDuration <= 0 {
+		c.RTC.StickyDuration = 10 * time.Minute
+	}
+	if c.RTC.SlotID == "" {
+		c.RTC.SlotID = "m.call#ROOM"
 	}
 	if c.Player.SearchLimit <= 0 {
 		c.Player.SearchLimit = 10
@@ -190,6 +226,14 @@ func (c *Config) validate() error {
 		}
 	}
 
+	switch c.RTC.Stack {
+	case StackLegacy, StackSticky, StackBoth:
+	default:
+		return fmt.Errorf("rtc.stack must be legacy, sticky or both, got %q", c.RTC.Stack)
+	}
+	if c.RTC.StickyDuration > time.Hour {
+		return fmt.Errorf("rtc.sticky_duration must not exceed 1h, got %s", c.RTC.StickyDuration)
+	}
 	switch c.Audio.VBR {
 	case "on", "constrained", "off":
 	default:
