@@ -19,6 +19,31 @@ rtc:
   livekit_service_url: ""
   display_name: "Jukebox"
 
+  # Which MatrixRTC dialect to speak.
+  #
+  #   legacy  the session-style org.matrix.msc3401.call.member state event and
+  #           the /sfu/get token endpoint: what Element Call deployments use
+  #           today.
+  #   sticky  the MSC4143 m.rtc.member event, sent as an MSC4354 sticky event,
+  #           with a token from /get_token: what replaces it.
+  #   both    publish both, so clients on either side of the transition see the
+  #           bot. This costs a second SFU connection — the two dialects derive
+  #           different LiveKit identities and one connection can only be one of
+  #           them — and so doubles the bot's upstream bandwidth.
+  #
+  # "sticky" and "both" fall back to legacy on a homeserver that does not
+  # advertise MSC4143 and MSC4354.
+  stack: "both"
+
+  # How long a published sticky membership stays valid without a refresh. The
+  # bot refreshes well ahead of this; the value only bounds how long a crashed
+  # bot lingers in the participant list. MSC4354 caps it at 1h.
+  sticky_duration: 10m
+
+  # The MatrixRTC slot to join. The default is the room-wide call every calling
+  # client uses; change it only if you know you need a separate session.
+  slot_id: "m.call#ROOM"
+
 jellyfin:
   server: http://jellyfin.local:8096
   api_key: "..."

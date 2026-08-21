@@ -58,6 +58,10 @@ func main() {
 	}
 }
 
+// leaveTimeout bounds the shutdown path: leaving a call happens after the
+// context that drove the bot has already been cancelled.
+const leaveTimeout = 15 * time.Second
+
 func run(configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -111,8 +115,23 @@ func run(configPath string) error {
 		return fmt.Errorf("join room %s: %w", roomID, err)
 	}
 
-	// Join the call: work out which SFU to use, get a token for it, publish our
-	// membership, then connect the media.
+	// Join the call. The bot speaks two MatrixRTC dialects: the session-style
+	// membership Element Call has always used, and the MSC4143 membership with
+	// MSC4354 sticky events that replaces it. They derive different LiveKit
+	// identities, so being audible to both audiences means one SFU connection
+	// per dialect.
+	caps, err := rtc.Probe(ctx, client)
+	if err != nil {
+		client.Log.Warn().Err(err).Msg("could not read homeserver features; assuming the legacy MatrixRTC stack only")
+	}
+	useSticky := cfg.RTC.UsesSticky() && caps.SupportsStickyMembership()
+	if cfg.RTC.UsesSticky() && !useSticky {
+		client.Log.Warn().
+			Bool("msc4354", caps.StickyEvents).
+			Bool("msc4143", caps.MatrixRTC).
+			Msg("homeserver does not support sticky MatrixRTC membership; using the legacy stack only")
+	}
+
 	membership := rtc.NewMembership(client, roomID, id.UserID(cfg.Matrix.UserID), deviceID)
 
 	serviceURL := cfg.RTC.LiveKitServiceURL
@@ -132,34 +151,95 @@ func run(configPath string) error {
 		client.Log.Info().Str("service", serviceURL).Msg("discovered MatrixRTC service")
 	}
 
-	sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
-	if err != nil {
-		return fmt.Errorf("get livekit token: %w", err)
-	}
-	client.Log.Info().Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).Msg("got livekit credentials")
+	var legs []rtc.NamedPublisher
+	var alias string
 
-	if err := membership.Join(ctx, rtc.Transport{
-		Type:              rtc.TransportTypeLiveKit,
-		LiveKitServiceURL: serviceURL,
-		LiveKitAlias:      sfu.Alias,
-	}); err != nil {
-		return err
-	}
-	defer func() {
-		leaveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := membership.Leave(leaveCtx); err != nil {
-			client.Log.Err(err).Msg("failed to leave call cleanly")
+	if cfg.RTC.UsesLegacy() {
+		sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
+		if err != nil {
+			return fmt.Errorf("get livekit token: %w", err)
 		}
-	}()
+		client.Log.Info().
+			Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).
+			Str("source", string(sfu.Source)).Msg("got livekit credentials")
 
-	publisher, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
-	if err != nil {
-		return err
+		if err := membership.Join(ctx, rtc.Transport{
+			Type:              rtc.TransportTypeLiveKit,
+			LiveKitServiceURL: serviceURL,
+			LiveKitAlias:      sfu.Alias,
+		}); err != nil {
+			return err
+		}
+		defer func() {
+			leaveCtx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
+			defer cancel()
+			if err := membership.Leave(leaveCtx); err != nil {
+				client.Log.Err(err).Msg("failed to leave call cleanly")
+			}
+		}()
+
+		pub, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+		if err != nil {
+			return err
+		}
+		defer pub.Close()
+		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Publisher: pub})
+		alias = sfu.Alias
 	}
-	defer publisher.Close()
+
+	if useSticky {
+		// Sticky membership is inert without an open slot: clients treat a
+		// member of a missing or closed slot as having left.
+		if err := rtc.EnsureSlot(ctx, client, roomID, cfg.RTC.SlotID); err != nil {
+			return err
+		}
+		sticky, err := rtc.NewStickyMembership(client, roomID, cfg.RTC.SlotID, cfg.RTC.StickyDuration)
+		if err != nil {
+			return err
+		}
+		sfu, err := rtc.GetStickyToken(ctx, client, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+		switch {
+		case err != nil:
+			return fmt.Errorf("get livekit token for sticky membership: %w", err)
+		case sfu == nil:
+			client.Log.Warn().Msg("no /get_token endpoint available; skipping sticky MatrixRTC membership")
+		case alias != "" && sfu.Alias != alias:
+			// Two aliases means two different LiveKit rooms, so the second
+			// connection would publish where nobody is listening.
+			client.Log.Warn().
+				Str("legacy_alias", alias).Str("sticky_alias", sfu.Alias).
+				Msg("token endpoints disagree on the livekit room; skipping sticky MatrixRTC membership")
+		default:
+			client.Log.Info().
+				Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).
+				Str("source", string(sfu.Source)).Msg("got livekit credentials for sticky membership")
+
+			if err := sticky.Join(ctx); err != nil {
+				return err
+			}
+			defer func() {
+				leaveCtx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
+				defer cancel()
+				if err := sticky.Leave(leaveCtx); err != nil {
+					client.Log.Err(err).Msg("failed to leave call cleanly on the sticky membership")
+				}
+			}()
+
+			pub, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+			if err != nil {
+				return err
+			}
+			defer pub.Close()
+			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Publisher: pub})
+		}
+	}
+
+	if len(legs) == 0 {
+		return fmt.Errorf("no MatrixRTC connection established; check rtc.stack in config.yaml")
+	}
+	publisher := rtc.NewMultiPublisher(log, legs...)
 	client.Log.Info().
-		Str("identity", publisher.Identity()).
+		Str("identities", publisher.Identity()).
 		Str("bitrate", cfg.Audio.Bitrate).
 		Str("vbr", cfg.Audio.VBR).
 		Int("channels", cfg.Audio.Channels()).

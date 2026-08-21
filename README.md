@@ -19,15 +19,44 @@ Anyone in the room can join the Element Call and hear it.
 Element Call is not peer-to-peer: it is MatrixRTC (MSC4143) on top of a LiveKit
 SFU (MSC4195). The bot therefore does three separate things to become audible:
 
-1. **Signalling** — publishes an `org.matrix.msc3401.call.member` state event so
-   Element Call clients show it as a participant, plus a *delayed leave* event
-   the homeserver fires if the bot dies without cleaning up.
-2. **Authorization** — asks the homeserver for a Matrix OpenID token and trades
-   it at the MatrixRTC authorization service (`lk-jwt-service`, discovered from
+1. **Signalling** — publishes a membership event so Element Call clients show it
+   as a participant, plus a *delayed leave* event the homeserver fires if the
+   bot dies without cleaning up.
+2. **Authorization** — trades a Matrix OpenID token at the MatrixRTC
+   authorization service (`lk-jwt-service`, discovered from
    `/.well-known/matrix/client`) for a LiveKit URL and JWT.
 3. **Media** — connects to the LiveKit SFU and publishes an Opus track. ffmpeg
    reads the track from Jellyfin and encodes it to Opus; the bot demuxes the Ogg
    stream and paces one 20 ms packet at a time into the SFU.
+
+## Two MatrixRTC dialects
+
+MatrixRTC is mid-transition, and the bot speaks both dialects at once
+(`rtc.stack: both`, the default):
+
+| | membership | token |
+|---|---|---|
+| legacy | `org.matrix.msc3401.call.member` state event | `POST /sfu/get` |
+| new | `m.rtc.member` sent as an [MSC4354] sticky event, in an `m.rtc.slot` | `POST /get_token` ([MSC4195]) |
+
+The catch is that the two derive **different LiveKit participant identities** for
+the same bot — `@bot:server:DEVICEID` against
+`base64(SHA256(["@bot:server","DEVICEID","<member.id>"]))` — and one connection
+can only be one identity. Publishing both memberships from a single connection
+would leave half the room looking at a tile that never makes a sound, so the bot
+opens **one SFU connection per dialect** and sends every Opus frame down both.
+ffmpeg still runs once; only the upstream is duplicated.
+
+The new dialect is used only when the homeserver advertises both
+`org.matrix.msc4143` and `org.matrix.msc4354` in `unstable_features`, and only
+when a `/get_token` endpoint answers — the homeserver's own
+(`/_matrix/client/v1/rtc/livekit/get_token`) is tried before the authorization
+service's. Otherwise the bot runs exactly as it did before. Set
+`rtc.stack: legacy` to opt out entirely, which is also the answer if the bot
+lacks the power level to open an `m.rtc.slot` in the room.
+
+[MSC4354]: https://github.com/matrix-org/matrix-spec-proposals/pull/4354
+[MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
 ## Requirements
 
@@ -291,8 +320,6 @@ homeserver or a LiveKit server.
 ## Limitations
 
 - No media E2EE, hence the unencrypted-room requirement above.
-- Uses the session-style (`org.matrix.msc3401.call.member`) membership event and
-  the legacy `/sfu/get` token endpoint. Both are what current Element Call
-  deployments use; the newer sticky-event membership (MSC4354) and `/get_token`
-  are not implemented.
 - One room per bot process.
+- In `both` mode the bot holds two SFU connections, so its upstream bandwidth is
+  doubled. See below.

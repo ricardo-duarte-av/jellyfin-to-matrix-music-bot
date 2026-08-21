@@ -67,11 +67,10 @@ type Membership struct {
 	deviceID string
 	stateKey string
 
-	mu       sync.Mutex
-	delayID  id.DelayID
-	joined   bool
-	stopKeep chan struct{}
-	keepDone chan struct{}
+	mu      sync.Mutex
+	delayID id.DelayID
+	joined  bool
+	keeper  *delayKeeper
 }
 
 // NewMembership builds a membership manager for the bot's own identity.
@@ -191,9 +190,7 @@ func (m *Membership) Join(ctx context.Context, transport Transport) error {
 	m.joined = true
 
 	if m.delayID != "" {
-		m.stopKeep = make(chan struct{})
-		m.keepDone = make(chan struct{})
-		go m.keepalive(m.stopKeep, m.keepDone, m.delayID)
+		m.keeper = startDelayKeeper(m.client, m.delayID, delayedLeaveRefresh)
 	}
 	return nil
 }
@@ -205,11 +202,8 @@ func (m *Membership) Leave(ctx context.Context) error {
 	if !m.joined {
 		return nil
 	}
-	if m.stopKeep != nil {
-		close(m.stopKeep)
-		<-m.keepDone
-		m.stopKeep, m.keepDone = nil, nil
-	}
+	m.keeper.Stop()
+	m.keeper = nil
 	if m.delayID != "" {
 		// Let the scheduled leave fire now rather than cancelling it: that is
 		// exactly the event we want published.
@@ -245,29 +239,6 @@ func (m *Membership) armDelayedLeaveLocked(ctx context.Context) error {
 	}
 	m.delayID = resp.UnstableDelayID
 	return nil
-}
-
-// keepalive restarts the delayed leave timer until the bot shuts down.
-func (m *Membership) keepalive(stop <-chan struct{}, done chan<- struct{}, delayID id.DelayID) {
-	defer close(done)
-	ticker := time.NewTicker(delayedLeaveRefresh)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), delayedLeaveRefresh)
-			_, err := m.client.UpdateDelayedEvent(ctx, &mautrix.ReqUpdateDelayedEvent{
-				DelayID: delayID,
-				Action:  event.DelayActionRestart,
-			})
-			cancel()
-			if err != nil {
-				m.client.Log.Warn().Err(err).Msg("failed to restart delayed leave event")
-			}
-		}
-	}
 }
 
 func parseContent(evt *event.Event, out *SessionMembership) error {

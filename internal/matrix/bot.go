@@ -97,6 +97,10 @@ func (b *Bot) Run(ctx context.Context) error {
 	syncer.OnEventType(callMemberEventType, func(ctx context.Context, evt *event.Event) {
 		b.handleCallMember(ctx, evt)
 	})
+	syncer.OnEventType(stickyMemberEventType, func(ctx context.Context, evt *event.Event) {
+		b.handleStickyMember(ctx, evt)
+	})
+	b.primeStickyOnFirstSync(syncer)
 
 	// Record who is already in the call before syncing. The initial sync
 	// replays that same state, and without this the bot would announce every
@@ -104,7 +108,45 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.primeCallWatcher(ctx)
 	b.advertiseCommands(ctx)
 
+	go b.sweepStickyMembershipsUntil(ctx)
+
 	return b.client.SyncWithContext(ctx)
+}
+
+// stickySweepInterval is how often lapsed sticky memberships are collected. It
+// only bounds how late a "left the call" is, so it can be coarse.
+const stickySweepInterval = 15 * time.Second
+
+// sweepStickyMembershipsUntil expires sticky memberships until ctx is done.
+func (b *Bot) sweepStickyMembershipsUntil(ctx context.Context) {
+	ticker := time.NewTicker(stickySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.sweepStickyMemberships(ctx)
+		}
+	}
+}
+
+// primeStickyOnFirstSync records the memberships already in flight without
+// announcing them, the way primeCallWatcher does for room state.
+//
+// Sticky memberships are not state: they arrive in the sync response, so they
+// cannot be read ahead of time. Sync listeners run before that response's events
+// are dispatched, so the flag is flipped on the second call — by which point the
+// first batch has been recorded silently.
+func (b *Bot) primeStickyOnFirstSync(syncer mautrix.ExtensibleSyncer) {
+	var syncs int
+	syncer.OnSync(func(ctx context.Context, resp *mautrix.RespSync, since string) bool {
+		syncs++
+		if syncs == 2 {
+			b.calls.primeSticky()
+		}
+		return true
+	})
 }
 
 // isHistorical reports whether an event predates the bot starting up, so a
@@ -412,6 +454,24 @@ func (b *Bot) cmdEject(ctx context.Context, cmd Command) {
 			continue
 		}
 		ejected++
+	}
+
+	// Sticky memberships are message events, so there is no state to blank out:
+	// redacting the event is what removes it. Clients that track the ephemeral
+	// map by event ID drop the entry; the rest see it lapse when its stickiness
+	// runs out, which is at most one refresh interval away.
+	stickyEvents := b.calls.stickyEventsOf(target, time.Now())
+	redactedSticky := 0
+	for _, eventID := range stickyEvents {
+		if _, err := b.client.RedactEvent(ctx, b.roomID, eventID); err != nil {
+			failed = err
+			continue
+		}
+		redactedSticky++
+	}
+	if redactedSticky > 0 {
+		b.calls.forgetSticky(target)
+		ejected += redactedSticky
 	}
 
 	name := b.displayName(ctx, target)
