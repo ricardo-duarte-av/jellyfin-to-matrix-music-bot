@@ -15,7 +15,12 @@ import (
 )
 
 // fakeLeg is one LiveKit connection that can be told to start failing.
+//
+// The reconnect tests drive it from two goroutines — the test itself and the
+// redial loop, which closes the connection it replaces — so its counters are
+// guarded and read back through the accessors below.
 type fakeLeg struct {
+	mu       sync.Mutex
 	identity string
 	frames   int
 	images   int
@@ -30,6 +35,8 @@ type fakeLeg struct {
 }
 
 func (f *fakeLeg) WriteOpus(frame []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -38,10 +45,14 @@ func (f *fakeLeg) WriteOpus(frame []byte) error {
 }
 
 func (f *fakeLeg) ShowImage(keyframe []byte) error {
+	f.mu.Lock()
 	if f.err != nil {
+		f.mu.Unlock()
 		return f.err
 	}
 	f.images++
+	f.mu.Unlock()
+
 	if f.ready != nil {
 		f.readyOnce.Do(func() { close(f.ready) })
 	}
@@ -49,6 +60,8 @@ func (f *fakeLeg) ShowImage(keyframe []byte) error {
 }
 
 func (f *fakeLeg) PublishVideo(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
@@ -57,15 +70,42 @@ func (f *fakeLeg) PublishVideo(name string) error {
 }
 
 func (f *fakeLeg) Identity() string { return f.identity }
-func (f *fakeLeg) OnLost(fn func()) { f.lost = fn }
-func (f *fakeLeg) Close()           { f.closed = true }
+
+func (f *fakeLeg) OnLost(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lost = fn
+}
+
+func (f *fakeLeg) Close() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+}
 
 // drop is the connection dying the way the SDK reports it.
 func (f *fakeLeg) drop() {
+	f.mu.Lock()
 	f.err = errors.New("livekit disconnected")
-	if f.lost != nil {
-		f.lost()
+	lost := f.lost
+	f.mu.Unlock()
+
+	if lost != nil {
+		lost()
 	}
+}
+
+// counts reports the frames, images and video tracks this leg has taken, and
+// whether it has been closed.
+func (f *fakeLeg) counts() (frames, images, videos int, closed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.frames, f.images, f.videos, f.closed
+}
+
+func (f *fakeLeg) frameCount() int {
+	frames, _, _, _ := f.counts()
+	return frames
 }
 
 func testMulti(legs ...*fakeLeg) (*MultiPublisher, []*leg) {
@@ -206,9 +246,9 @@ func TestLostLegIsReconnected(t *testing.T) {
 
 	waitFor(t, "the replacement leg to receive audio", func() bool {
 		_ = m.WriteOpus([]byte{1})
-		return second.frames > 0
+		return second.frameCount() > 0
 	})
-	if !first.closed {
+	if _, _, _, closed := first.counts(); !closed {
 		t.Error("the dead connection was left open")
 	}
 }
@@ -234,11 +274,12 @@ func TestReconnectRestoresTheVideoTile(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the tile to be restored on the new connection")
 	}
-	if second.videos != 1 {
-		t.Errorf("replacement leg published %d video tracks; want 1", second.videos)
+	_, images, videos, _ := second.counts()
+	if videos != 1 {
+		t.Errorf("replacement leg published %d video tracks; want 1", videos)
 	}
-	if second.images != 1 {
-		t.Errorf("replacement leg showed %d images; want 1", second.images)
+	if images != 1 {
+		t.Errorf("replacement leg showed %d images; want 1", images)
 	}
 }
 
@@ -259,7 +300,7 @@ func TestReconnectRetriesUntilTheSFUIsBack(t *testing.T) {
 
 	waitFor(t, "the replacement leg to receive audio", func() bool {
 		_ = m.WriteOpus([]byte{1})
-		return second.frames > 0
+		return second.frameCount() > 0
 	})
 	if got := attempts.Load(); got < 3 {
 		t.Errorf("dialled %d times; want the failures to have been retried", got)
