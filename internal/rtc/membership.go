@@ -41,6 +41,9 @@ const (
 	// keepalive before publishing our leave event. MSC4143 suggests 15-30s for
 	// this dead man's switch.
 	delayedLeaveTimeout = 30 * time.Second
+	// membershipCheck is how often the published membership is read back. It is
+	// a safety net rather than the main mechanism, so it can be leisurely.
+	membershipCheck = time.Minute
 	// delayedLeaveRefresh must be comfortably shorter than the timeout. A third
 	// of it gives three chances to make the deadline: at one refresh per
 	// timeout minus a hair, a single slow round trip is enough for the
@@ -240,6 +243,56 @@ func (m *Membership) Leave(ctx context.Context) error {
 		return fmt.Errorf("retract call membership: %w", err)
 	}
 	return nil
+}
+
+// Watch re-publishes the membership whenever it goes missing from room state,
+// until ctx is done.
+//
+// The delayed-leave keeper heals the usual case — a leave the homeserver
+// published because a refresh was late — but only that one: it is driven by the
+// delay going 404, so a membership that disappears any other way leaves nothing
+// to notice. A homeserver restart can produce exactly that, and there is no
+// other loop watching, since this stack's membership is state and never expires
+// on its own. Reading one state event a minute is a cheap way to be sure.
+func (m *Membership) Watch(ctx context.Context) {
+	ticker := time.NewTicker(membershipCheck)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.reconcile(ctx)
+		}
+	}
+}
+
+// reconcile re-sends the membership if the homeserver no longer has it.
+func (m *Membership) reconcile(ctx context.Context) {
+	m.mu.Lock()
+	joined, content := m.joined, m.content
+	m.mu.Unlock()
+	if !joined || content == nil {
+		return
+	}
+
+	var published SessionMembership
+	err := m.client.StateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, &published)
+	switch {
+	case err != nil && !isNotFound(err):
+		m.client.Log.Warn().Err(err).Msg("could not read back the call membership")
+		return
+	case err == nil && published.Application == applicationCall:
+		return
+	}
+
+	// Either the event is gone or it has been emptied out — both mean every
+	// client in the room believes the bot left, while it is still connected to
+	// the SFU and streaming.
+	m.client.Log.Warn().Msg("call membership is no longer published; re-publishing it")
+	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, content); err != nil {
+		m.client.Log.Err(err).Msg("failed to re-publish the call membership")
+	}
 }
 
 // recover re-publishes the membership and arms a new delayed leave, after the

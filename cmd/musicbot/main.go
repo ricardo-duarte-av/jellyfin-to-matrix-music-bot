@@ -155,6 +155,18 @@ func run(configPath string) error {
 	var alias string
 
 	if cfg.RTC.UsesLegacy() {
+		// dial is used both for the first connection and for every
+		// reconnection: the LiveKit token is minted from a single-use OpenID
+		// token, so getting back in after the SFU drops us means redoing the
+		// whole exchange, not reusing the JWT.
+		dial := func(ctx context.Context) (*rtc.Publisher, error) {
+			sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
+			if err != nil {
+				return nil, fmt.Errorf("get livekit token: %w", err)
+			}
+			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+		}
+
 		sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
 		if err != nil {
 			return fmt.Errorf("get livekit token: %w", err)
@@ -178,12 +190,17 @@ func run(configPath string) error {
 			}
 		}()
 
+		// Watch the published membership, not just the delayed leave: the
+		// keeper only heals a leave the homeserver fired, and the membership
+		// can go missing without that.
+		go membership.Watch(ctx)
+
 		pub, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
 		if err != nil {
 			return err
 		}
 		defer pub.Close()
-		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Publisher: pub})
+		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Publisher: pub, Dial: dial})
 		alias = sfu.Alias
 	}
 
@@ -197,6 +214,20 @@ func run(configPath string) error {
 		if err != nil {
 			return err
 		}
+		// The member ID is fixed for the life of this membership and the
+		// LiveKit identity is derived from it, so a reconnection lands back on
+		// the same identity the published membership points at.
+		dial := func(ctx context.Context) (*rtc.Publisher, error) {
+			sfu, err := rtc.GetStickyToken(ctx, client, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+			if err != nil {
+				return nil, fmt.Errorf("get livekit token for sticky membership: %w", err)
+			}
+			if sfu == nil {
+				return nil, fmt.Errorf("no /get_token endpoint available")
+			}
+			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+		}
+
 		sfu, err := rtc.GetStickyToken(ctx, client, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
 		switch {
 		case err != nil:
@@ -230,7 +261,7 @@ func run(configPath string) error {
 				return err
 			}
 			defer pub.Close()
-			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Publisher: pub})
+			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Publisher: pub, Dial: dial})
 		}
 	}
 
@@ -238,6 +269,10 @@ func run(configPath string) error {
 		return fmt.Errorf("no MatrixRTC connection established; check rtc.stack in config.yaml")
 	}
 	publisher := rtc.NewMultiPublisher(log, legs...)
+	// Closing the group is what stops the reconnect loops and disconnects
+	// whatever connection each leg is on now, which after a reconnection is no
+	// longer the one the per-leg defers above captured.
+	defer publisher.Close()
 	client.Log.Info().
 		Str("identities", publisher.Identity()).
 		Str("bitrate", cfg.Audio.Bitrate).

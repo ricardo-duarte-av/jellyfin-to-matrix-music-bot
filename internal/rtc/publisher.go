@@ -34,6 +34,14 @@ type Publisher struct {
 	pub   *lksdk.LocalTrackPublication
 
 	video *videoTrack
+
+	// lost is called once the SDK gives up on the connection, and dropped
+	// records that it has. A dropped connection is dead for good: the SDK's own
+	// reconnect budget is about ten attempts over a minute and a half, and once
+	// that is spent nothing revives the room.
+	lost    func()
+	dropped bool
+	closed  bool
 }
 
 // videoRefresh is the safety net for the still image: subscribers normally get
@@ -49,8 +57,10 @@ const videoRefresh = 10 * time.Second
 // parameters, the SDP fmtp offered to subscribers, and the AddTrackRequest the
 // SFU uses when describing the track onwards.
 func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, error) {
-	room, err := lksdk.ConnectToRoomWithToken(cfg.URL, cfg.JWT, &lksdk.RoomCallback{},
-		lksdk.WithAutoSubscribe(false))
+	p := &Publisher{}
+	room, err := lksdk.ConnectToRoomWithToken(cfg.URL, cfg.JWT, &lksdk.RoomCallback{
+		OnDisconnected: p.dropConnection,
+	}, lksdk.WithAutoSubscribe(false))
 	if err != nil {
 		return nil, fmt.Errorf("connect to livekit at %s: %w", cfg.URL, err)
 	}
@@ -84,15 +94,62 @@ func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, erro
 		return nil, fmt.Errorf("publish audio track: %w", err)
 	}
 
-	return &Publisher{room: room, track: track, pub: pub}, nil
+	p.mu.Lock()
+	p.room, p.track, p.pub = room, track, pub
+	p.mu.Unlock()
+	return p, nil
+}
+
+// OnLost registers the callback fired when the connection drops for good. It
+// runs immediately if the connection has already gone, so a caller that
+// registers late cannot miss the notification.
+//
+// Nothing else reports this: the SDK silently swallows writes to a room it has
+// given up on — WriteSample returns nil once the packetizer is torn down — so
+// without this a dead connection looks exactly like a healthy one.
+func (p *Publisher) OnLost(fn func()) {
+	p.mu.Lock()
+	missed := p.dropped && !p.closed
+	if !p.dropped && !p.closed {
+		p.lost = fn
+	}
+	p.mu.Unlock()
+
+	if missed && fn != nil {
+		fn()
+	}
+}
+
+// dropConnection marks the connection dead and notifies the owner. The SDK
+// calls it on a deliberate Disconnect too, which is why a closed publisher
+// notifies nobody: that leave was our idea.
+func (p *Publisher) dropConnection() {
+	p.mu.Lock()
+	if p.dropped || p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.dropped = true
+	fn := p.lost
+	p.lost = nil
+	p.mu.Unlock()
+
+	if fn != nil {
+		// The SDK calls this from its own goroutine; reconnecting from here
+		// would block it for as long as the redial takes.
+		go fn()
+	}
 }
 
 // WriteOpus sends one encoded Opus frame to the SFU. The caller is responsible
 // for pacing: this does not block for the frame's duration.
 func (p *Publisher) WriteOpus(frame []byte) error {
 	p.mu.Lock()
-	track := p.track
+	track, dropped := p.track, p.dropped
 	p.mu.Unlock()
+	if dropped {
+		return fmt.Errorf("livekit connection lost")
+	}
 	if track == nil {
 		return fmt.Errorf("publisher is closed")
 	}
@@ -152,6 +209,7 @@ func (p *Publisher) Close() {
 	p.mu.Lock()
 	room, pub, video := p.room, p.pub, p.video
 	p.track, p.room, p.pub, p.video = nil, nil, nil, nil
+	p.closed, p.lost = true, nil
 	p.mu.Unlock()
 
 	if video != nil {

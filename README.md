@@ -58,6 +58,22 @@ lacks the power level to open an `m.rtc.slot` in the room.
 [MSC4354]: https://github.com/matrix-org/matrix-spec-proposals/pull/4354
 [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
+## Staying in the call
+
+Both halves of "being in a call" can fail on their own, so both are watched:
+
+* **The SFU connection.** The LiveKit SDK reconnects by itself, but only for
+  about a minute and a half; a server that takes longer to come back leaves the
+  connection dead with no error — writes to it silently succeed. The bot listens
+  for that disconnect and redials the whole join (a fresh OpenID token, a fresh
+  LiveKit JWT), backing off from 2s to a minute, for as long as it takes. The
+  identity it comes back on is the same one its published membership points at,
+  and the album art track is republished with it.
+* **The membership.** The delayed leave is refreshed every 10s, and if the
+  homeserver has forgotten it — which almost always means it published the
+  leave — the bot rejoins and arms a new one. The legacy membership is also read
+  back once a minute and re-published if it has gone missing some other way.
+
 ## Requirements
 
 - Go 1.25+ (the toolchain is pinned in `go.mod` and downloaded automatically)
