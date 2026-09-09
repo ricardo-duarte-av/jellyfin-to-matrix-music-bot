@@ -1,13 +1,20 @@
 package matrix
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/config"
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/rtc"
 )
 
@@ -199,5 +206,165 @@ func TestStickyEventsOfListsRedactionTargets(t *testing.T) {
 	}
 	if !w.stillPresent("@alice:example.org") {
 		t.Error("forgetSticky() removed somebody else's membership")
+	}
+}
+
+// The bot is in the call by definition, and through both dialects at once, so
+// its own memberships must never count as an audience.
+func TestAnyoneElseIgnoresTheBotItself(t *testing.T) {
+	const self = id.UserID("@bot:example.org")
+	now := time.Now()
+
+	w := primedWatcher()
+	if w.anyoneElse(self, now) {
+		t.Error("anyoneElse() = true on an empty call")
+	}
+
+	// Both of the bot's own memberships, in the two state key formats and the
+	// sticky dialect.
+	w.applyLegacy(self, "_@bot:example.org_DEVICE", true)
+	w.applySticky(stickyMember(t, self, "$self", "SELF", "join", now.UnixMilli(), 10*time.Minute),
+		true, now.Add(10*time.Minute), "SELF", now)
+	if w.anyoneElse(self, now) {
+		t.Error("anyoneElse() = true with only the bot's own memberships")
+	}
+
+	w.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	if !w.anyoneElse(self, now) {
+		t.Error("anyoneElse() = false with a listener in the call")
+	}
+
+	w.applyLegacy(bob, "_@bob:example.org_PHONE", false)
+	if w.anyoneElse(self, now) {
+		t.Error("anyoneElse() = true after the only listener left")
+	}
+}
+
+// A sticky membership that has lapsed is not an audience: a client that crashed
+// stops refreshing and never sends a leave.
+func TestAnyoneElseIgnoresExpiredStickyMemberships(t *testing.T) {
+	const self = id.UserID("@bot:example.org")
+	now := time.Now()
+	w := primedWatcher()
+
+	w.applySticky(stickyMember(t, bob, "$1", "MEMBER", "join", now.UnixMilli(), time.Minute),
+		true, now.Add(time.Minute), "MEMBER", now)
+	if !w.anyoneElse(self, now) {
+		t.Fatal("anyoneElse() = false with a live sticky membership")
+	}
+	if w.anyoneElse(self, now.Add(2*time.Minute)) {
+		t.Error("anyoneElse() = true after the sticky membership lapsed")
+	}
+}
+
+// fakePlayback is the player as the empty-call rules see it.
+type fakePlayback struct {
+	playing bool
+	pauses  int
+	resumes int
+}
+
+func (f *fakePlayback) Pause() bool {
+	if !f.playing {
+		return false
+	}
+	f.playing = false
+	f.pauses++
+	return true
+}
+
+func (f *fakePlayback) Resume() bool {
+	if f.playing {
+		return false
+	}
+	f.playing = true
+	f.resumes++
+	return true
+}
+
+// audienceBot is a bot with just enough wired up to run the empty-call rules,
+// pointed at a homeserver that swallows whatever it announces.
+func audienceBot(t *testing.T, pause bool) (*Bot, *fakePlayback) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"event_id": "$sent"})
+	}))
+	t.Cleanup(srv.Close)
+	client, err := mautrix.NewClient(srv.URL, "@bot:example.org", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Log = zerolog.New(io.Discard)
+
+	play := &fakePlayback{playing: true}
+	return &Bot{
+		cfg:      &config.Config{Player: config.Player{PauseWhenAlone: &pause}},
+		client:   client,
+		playback: play,
+		calls:    primedWatcher(),
+		roomID:   "!room:example.org",
+	}, play
+}
+
+// The point of the whole thing: an empty call stops the music, and someone
+// arriving starts it again.
+func TestPlaybackFollowsTheAudience(t *testing.T) {
+	ctx := context.Background()
+	b, play := audienceBot(t, true)
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+	if play.pauses != 0 {
+		t.Fatalf("paused %d times with a listener in the call; want none", play.pauses)
+	}
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", false)
+	b.followAudience(ctx)
+	if play.playing {
+		t.Fatal("still playing to an empty call")
+	}
+
+	// A second membership change while the call is still empty must not pile up
+	// announcements.
+	b.followAudience(ctx)
+	if play.pauses != 1 {
+		t.Errorf("paused %d times; want 1", play.pauses)
+	}
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+	if !play.playing || play.resumes != 1 {
+		t.Errorf("playing = %v after %d resumes; want it playing again", play.playing, play.resumes)
+	}
+}
+
+// A pause somebody typed is theirs to undo: filling the call back up must not
+// start the music behind their back.
+func TestManualPauseSurvivesSomeoneJoining(t *testing.T) {
+	ctx := context.Background()
+	b, play := audienceBot(t, true)
+
+	// Someone pauses by hand, then joins the call.
+	b.clearAutoPause()
+	play.Pause()
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+
+	if play.playing {
+		t.Error("a hand-made pause was resumed when someone joined")
+	}
+}
+
+// The whole behaviour is opt-out.
+func TestPauseWhenAloneCanBeTurnedOff(t *testing.T) {
+	ctx := context.Background()
+	b, play := audienceBot(t, false)
+
+	b.followAudience(ctx)
+
+	if !play.playing || play.pauses != 0 {
+		t.Errorf("paused %d times with pause_when_alone off; want none", play.pauses)
 	}
 }

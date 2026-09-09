@@ -125,7 +125,15 @@ type Player struct {
 	ResultTTL   time.Duration `yaml:"result_ttl"`
 	MaxQueue    int           `yaml:"max_queue"`
 	FFmpegPath  string        `yaml:"ffmpeg_path"`
+	// PauseWhenAlone pauses playback when the last listener leaves the call
+	// and resumes it when someone joins, rather than streaming to an empty
+	// room. It is a pointer so an explicit "false" is distinguishable from the
+	// key being absent.
+	PauseWhenAlone *bool `yaml:"pause_when_alone"`
 }
+
+// PausesWhenAlone reports whether playback follows the call being empty.
+func (p Player) PausesWhenAlone() bool { return p.PauseWhenAlone == nil || *p.PauseWhenAlone }
 
 // Load reads, defaults and validates the config file at path.
 func Load(path string) (*Config, error) {

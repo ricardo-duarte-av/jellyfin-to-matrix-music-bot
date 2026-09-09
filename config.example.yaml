@@ -55,6 +55,9 @@ player:
   result_ttl: 10m
   max_queue: 200
   ffmpeg_path: ffmpeg
+  # Pause when the last listener leaves the call, and resume when someone
+  # joins again. Set to false to keep streaming to an empty call.
+  pause_when_alone: true
 
 audio:
   # Target bitrate for the Opus encode. The bot sends this rate constantly to

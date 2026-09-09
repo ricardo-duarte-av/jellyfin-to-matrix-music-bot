@@ -147,6 +147,28 @@ func (w *callWatcher) handlesLocked(userID id.UserID, now time.Time) int {
 	return count
 }
 
+// anyoneElse reports whether the call holds a membership that is not self's.
+//
+// The bot is in the call by definition — twice over, once per dialect — so the
+// question "is anyone listening" is only ever about the memberships that are
+// not its own.
+func (w *callWatcher) anyoneElse(self id.UserID, now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for stateKey := range w.present {
+		if !rtc.MembershipBelongsTo(stateKey, self) {
+			return true
+		}
+	}
+	for handle, entry := range w.sticky {
+		if handle.sender != self && entry.joined && entry.expiresAt.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
 // applySticky records a sticky membership event and reports what it means for
 // the sender's presence overall.
 func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.Time, stickyKey string, now time.Time) callChange {
@@ -302,9 +324,11 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 	case callJoined:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("joined the call")
 		b.announcePresence(ctx, evt.Sender, "joined")
+		b.followAudience(ctx)
 	case callLeft:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("left the call")
 		b.announcePresence(ctx, evt.Sender, "left")
+		b.followAudience(ctx)
 	case callNoChange:
 		// Someone in the call from two devices who closes one has not left, and
 		// neither has someone whose other dialect still says they are there.
@@ -354,18 +378,83 @@ func (b *Bot) handleStickyMember(ctx context.Context, evt *event.Event) {
 	case callJoined:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("joined the call")
 		b.announcePresence(ctx, evt.Sender, "joined")
+		b.followAudience(ctx)
 	case callLeft:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("left the call")
 		b.announcePresence(ctx, evt.Sender, "left")
+		b.followAudience(ctx)
 	}
 }
 
 // sweepStickyMemberships announces the members whose stickiness has lapsed.
 func (b *Bot) sweepStickyMemberships(ctx context.Context) {
-	for _, user := range b.calls.expireSticky(time.Now()) {
+	left := b.calls.expireSticky(time.Now())
+	for _, user := range left {
 		b.client.Log.Info().Str("user_id", user.String()).Msg("call membership expired")
 		b.announcePresence(ctx, user, "left")
 	}
+	if len(left) > 0 {
+		b.followAudience(ctx)
+	}
+}
+
+// followAudience pauses playback while the bot is alone in the call and picks
+// it up again when someone joins.
+//
+// It runs after every membership change rather than on a timer: the watcher
+// already knows who is in the call, so this is only a question asked of state
+// that has just been updated.
+func (b *Bot) followAudience(ctx context.Context) {
+	if !b.cfg.Player.PausesWhenAlone() {
+		return
+	}
+	if b.calls.anyoneElse(b.client.UserID, time.Now()) {
+		b.resumeForAudience(ctx)
+		return
+	}
+	b.pauseForEmptyCall(ctx)
+}
+
+// pauseForEmptyCall holds playback once the last listener has gone.
+func (b *Bot) pauseForEmptyCall(ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Pause reports whether it actually stopped anything, which makes this
+	// idempotent: nothing playing, or already paused, and there is nothing to
+	// do. It deliberately does not consult autoPaused — playback started while
+	// the call was empty should still be held at the next membership change.
+	if !b.playback.Pause() {
+		return
+	}
+	b.autoPaused = true
+	b.client.Log.Info().Msg("nobody left in the call; pausing playback")
+	b.send(ctx, "Nobody is left in the call — pausing. I will pick up where I left off when someone joins.", "")
+}
+
+// resumeForAudience undoes a pause the empty call caused. A pause somebody
+// asked for is theirs to undo.
+func (b *Bot) resumeForAudience(ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.autoPaused {
+		return
+	}
+	b.autoPaused = false
+	if !b.playback.Resume() {
+		// Someone hit !resume, or the queue was cleared, while the call was
+		// empty. Whatever the player is doing now is what was asked for.
+		return
+	}
+	b.client.Log.Info().Msg("someone joined the call; resuming playback")
+	b.send(ctx, "Resuming.", "")
+}
+
+// clearAutoPause forgets that the bot paused itself, so that a pause or resume
+// somebody typed is not undone the next time the call fills or empties.
+func (b *Bot) clearAutoPause() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.autoPaused = false
 }
 
 // announcePresence posts "<pill> joined/left the call".

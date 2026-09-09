@@ -58,6 +58,27 @@ lacks the power level to open an `m.rtc.slot` in the room.
 [MSC4354]: https://github.com/matrix-org/matrix-spec-proposals/pull/4354
 [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
+## Nobody in the call
+
+When the last listener leaves, the bot pauses instead of streaming to an empty
+call, and resumes where it left off as soon as someone joins:
+
+```
+[bob left the call.]
+Nobody is left in the call — pausing. I will pick up where I left off when someone joins.
+[bob joined the call.]
+Resuming.
+```
+
+Only a pause the bot made itself is undone this way: a `!pause` somebody typed
+stays paused until they say otherwise. The bot's own membership never counts as
+an audience, and neither does a sticky membership that has lapsed — a client
+that crashed stops refreshing rather than sending a leave. Playback started with
+`!play` while the call is empty is left alone; the rule reacts to people
+leaving, not to the queue.
+
+Set `player.pause_when_alone: false` to keep streaming regardless.
+
 ## Staying in the call
 
 Both halves of "being in a call" can fail on their own, so both are watched:

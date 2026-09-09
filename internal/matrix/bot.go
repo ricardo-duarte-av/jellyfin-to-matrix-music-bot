@@ -8,6 +8,7 @@ import (
 	"html"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -22,19 +23,37 @@ import (
 
 // Bot wires chat commands to the Jellyfin library and the player.
 type Bot struct {
-	cfg     *config.Config
-	client  *mautrix.Client
-	jf      *jellyfin.Client
-	player  *player.Player
-	results *results
-	artwork *artworkCache
-	calls   *callWatcher
+	cfg    *config.Config
+	client *mautrix.Client
+	jf     *jellyfin.Client
+	player *player.Player
+	// playback is the player behind the two methods presence handling needs.
+	// It is an interface so the empty-call rules can be exercised without a
+	// real audio pipeline behind them.
+	playback playback
+	results  *results
+	artwork  *artworkCache
+	calls    *callWatcher
 	// art renders the in-call video tile; nil when video is not published.
 	art    ArtPublisher
 	roomID id.RoomID
 	// startedAt drops events from before the bot came up, so a restart does not
 	// replay old commands.
 	startedAt time.Time
+
+	// mu guards autoPaused, which is touched from the sync goroutine and from
+	// the sticky expiry sweep.
+	mu sync.Mutex
+	// autoPaused records that the empty call, rather than a person, paused
+	// playback. Only a pause the bot made itself is undone automatically.
+	autoPaused bool
+}
+
+// playback is the slice of the player that the empty-call rules drive. Both
+// methods report whether they changed anything.
+type playback interface {
+	Pause() bool
+	Resume() bool
 }
 
 // ArtPublisher shows an album cover on the bot's in-call video tile.
@@ -77,6 +96,7 @@ func New(cfg *config.Config, client *mautrix.Client, jf *jellyfin.Client, plr *p
 		client:    client,
 		jf:        jf,
 		player:    plr,
+		playback:  plr,
 		results:   newResults(cfg.Player.ResultTTL),
 		artwork:   newArtworkCache(artworkCacheSize),
 		calls:     newCallWatcher(),
@@ -250,12 +270,16 @@ func (b *Bot) dispatch(ctx context.Context, evt *event.Event, cmd Command) {
 	case "nowplaying":
 		b.cmdNowPlaying(ctx)
 	case "pause":
+		// A pause somebody asked for is theirs to undo: the bot must not
+		// resume it the next time the call fills up.
+		b.clearAutoPause()
 		if b.player.Pause() {
 			b.reply(ctx, "Paused.", "")
 		} else {
 			b.reply(ctx, "Nothing is playing.", "")
 		}
 	case "resume":
+		b.clearAutoPause()
 		if b.player.Resume() {
 			b.reply(ctx, "Resumed.", "")
 		} else {
@@ -485,6 +509,10 @@ func (b *Bot) cmdEject(ctx context.Context, cmd Command) {
 		formatted := fmt.Sprintf("Ejected %s from the call (%d device(s)). They can rejoin.",
 			userPill(target, name), ejected)
 		b.reply(ctx, plain, formatted)
+		// Ejecting the last listener empties the call. The redacted sticky
+		// memberships are dropped here rather than through a sync handler, so
+		// nothing else would notice.
+		b.followAudience(ctx)
 	}
 }
 
