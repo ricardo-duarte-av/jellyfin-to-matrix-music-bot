@@ -44,6 +44,11 @@ const (
 	// membershipCheck is how often the published membership is read back. It is
 	// a safety net rather than the main mechanism, so it can be leisurely.
 	membershipCheck = time.Minute
+	// membershipRenewAhead is how much of the expiry window is left when the
+	// membership is renewed. It is generous on purpose: at one check a minute
+	// this leaves hundreds of attempts before other clients would time the bot
+	// out, so a homeserver that is briefly unreachable costs nothing.
+	membershipRenewAhead = 30 * time.Minute
 	// delayedLeaveRefresh must be comfortably shorter than the timeout. A third
 	// of it gives three chances to make the deadline: at one refresh per
 	// timeout minus a hair, a single slow round trip is enough for the
@@ -245,15 +250,20 @@ func (m *Membership) Leave(ctx context.Context) error {
 	return nil
 }
 
-// Watch re-publishes the membership whenever it goes missing from room state,
-// until ctx is done.
+// Watch keeps the published membership alive — re-publishing it when it goes
+// missing from room state, renewing it before it lapses — until ctx is done.
 //
 // The delayed-leave keeper heals the usual case — a leave the homeserver
 // published because a refresh was late — but only that one: it is driven by the
 // delay going 404, so a membership that disappears any other way leaves nothing
-// to notice. A homeserver restart can produce exactly that, and there is no
-// other loop watching, since this stack's membership is state and never expires
-// on its own. Reading one state event a minute is a cheap way to be sure.
+// to notice. A homeserver restart can produce exactly that.
+//
+// Staying put is not the same as staying valid, either. The state event never
+// expires on its own, so the homeserver keeps serving it for as long as the
+// room exists, while every client applies the expires field and quietly drops
+// the bot from the call a few hours after it joined. Both failures look
+// identical from inside the bot — it is connected, streaming, and nobody can
+// hear it — so one read of one state event a minute covers them together.
 func (m *Membership) Watch(ctx context.Context) {
 	ticker := time.NewTicker(membershipCheck)
 	defer ticker.Stop()
@@ -267,7 +277,8 @@ func (m *Membership) Watch(ctx context.Context) {
 	}
 }
 
-// reconcile re-sends the membership if the homeserver no longer has it.
+// reconcile re-sends the membership if the homeserver no longer has it, and
+// renews it before the expiry it was published with runs out.
 func (m *Membership) reconcile(ctx context.Context) {
 	m.mu.Lock()
 	joined, content := m.joined, m.content
@@ -283,6 +294,13 @@ func (m *Membership) reconcile(ctx context.Context) {
 		m.client.Log.Warn().Err(err).Msg("could not read back the call membership")
 		return
 	case err == nil && published.Application == applicationCall:
+		if !expiringSoon(&published, time.Now()) {
+			return
+		}
+		// The event is exactly where it was left, and about to stop counting:
+		// expires is a lifetime, and this one does not extend itself.
+		m.client.Log.Info().Msg("call membership is close to expiring; renewing it")
+		m.publish(ctx, "renew the call membership")
 		return
 	}
 
@@ -290,9 +308,49 @@ func (m *Membership) reconcile(ctx context.Context) {
 	// client in the room believes the bot left, while it is still connected to
 	// the SFU and streaming.
 	m.client.Log.Warn().Msg("call membership is no longer published; re-publishing it")
-	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, content); err != nil {
-		m.client.Log.Err(err).Msg("failed to re-publish the call membership")
+	m.publish(ctx, "re-publish the call membership")
+}
+
+// publish sends the membership with a renewed expiry, logging what it was for.
+func (m *Membership) publish(ctx context.Context, what string) {
+	m.mu.Lock()
+	content := m.renewLocked()
+	m.mu.Unlock()
+	if content == nil {
+		return
 	}
+	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, content); err != nil {
+		m.client.Log.Err(err).Msgf("failed to %s", what)
+	}
+}
+
+// renewLocked pushes the cached membership's expiry out to a full window from
+// now and returns what to publish. Caller must hold m.mu.
+//
+// created_ts stays where it is. expires is a lifetime measured from created_ts,
+// and created_ts is also what decides focus ordering, so a membership that
+// renewed itself by moving its origin would reshuffle the call every few hours.
+// The content is replaced rather than edited in place: whoever is publishing
+// the old pointer keeps a consistent view of it.
+func (m *Membership) renewLocked() *SessionMembership {
+	if m.content == nil {
+		return nil
+	}
+	if m.content.Expires > 0 {
+		renewed := *m.content
+		renewed.Expires = time.Now().UnixMilli() - renewed.CreatedTS + membershipExpiry.Milliseconds()
+		m.content = &renewed
+	}
+	return m.content
+}
+
+// expiringSoon reports whether a membership has less than membershipRenewAhead
+// of its lifetime left. A membership without an expiry never does.
+func expiringSoon(content *SessionMembership, now time.Time) bool {
+	if content.Expires <= 0 {
+		return false
+	}
+	return now.Add(membershipRenewAhead).UnixMilli() >= content.CreatedTS+content.Expires
 }
 
 // recover re-publishes the membership and arms a new delayed leave, after the
@@ -311,7 +369,7 @@ func (m *Membership) recover(ctx context.Context) (id.DelayID, error) {
 	if err := m.armDelayedLeaveLocked(ctx); err != nil {
 		return "", err
 	}
-	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, m.content); err != nil {
+	if _, err := m.client.SendStateEvent(ctx, m.roomID, CallMemberEventType, m.stateKey, m.renewLocked()); err != nil {
 		return "", fmt.Errorf("re-send call membership: %w", err)
 	}
 	return m.delayID, nil

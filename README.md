@@ -93,7 +93,11 @@ Both halves of "being in a call" can fail on their own, so both are watched:
 * **The membership.** The delayed leave is refreshed every 10s, and if the
   homeserver has forgotten it — which almost always means it published the
   leave — the bot rejoins and arms a new one. The legacy membership is also read
-  back once a minute and re-published if it has gone missing some other way.
+  back once a minute: re-published if it has gone missing some other way, and
+  renewed when its `expires` is running out. That state event never expires on
+  its own, so a stale one sits in the room looking healthy while every client
+  reading it has already dropped the bot from the call. Renewing extends the
+  lifetime and leaves `created_ts` alone, so focus ordering does not reshuffle.
 
 ## Requirements
 

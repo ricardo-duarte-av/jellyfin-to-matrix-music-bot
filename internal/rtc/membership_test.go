@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
@@ -190,6 +191,91 @@ func TestReconcileLeavesAHealthyMembershipAlone(t *testing.T) {
 
 	if room.publishedCount() != 0 {
 		t.Errorf("re-published %d memberships; want none while ours is still there", room.publishedCount())
+	}
+}
+
+// A membership can rot where it stands: the state event never expires on its
+// own, so the homeserver keeps serving it while every client applies the
+// expires field and drops the bot from the call. Nothing else renews it.
+func TestReconcileRenewsAMembershipThatIsAboutToExpire(t *testing.T) {
+	created := time.Now().Add(-4 * time.Hour)
+	// Published, healthy, and five minutes from stopping to count.
+	content := SessionMembership{
+		Application: applicationCall,
+		DeviceID:    "DEVICE",
+		CreatedTS:   created.UnixMilli(),
+		Expires:     (4*time.Hour + 5*time.Minute).Milliseconds(),
+	}
+	onTheServer := content
+	room := &stateRoom{current: &onTheServer}
+	m := joinedMembership(room.client(t))
+	m.content = &content
+
+	m.reconcile(context.Background())
+
+	if room.publishedCount() != 1 {
+		t.Fatalf("published %d memberships; want the expiring one renewed", room.publishedCount())
+	}
+	renewed := room.published[0]
+	// created_ts decides focus ordering, so renewing must extend the lifetime
+	// rather than move its origin.
+	if renewed.CreatedTS != created.UnixMilli() {
+		t.Errorf("renewed created_ts = %d; want the original %d", renewed.CreatedTS, created.UnixMilli())
+	}
+	expiresAt := renewed.CreatedTS + renewed.Expires
+	if want := time.Now().Add(membershipExpiry - time.Minute).UnixMilli(); expiresAt < want {
+		t.Errorf("renewed membership expires at %d; want a full window, past %d", expiresAt, want)
+	}
+
+	// The renewal has to stick to what is cached, or recover would put the
+	// stale lifetime back the next time it re-sends the membership.
+	m.mu.Lock()
+	cached := m.content.Expires
+	m.mu.Unlock()
+	if cached != renewed.Expires {
+		t.Errorf("cached expires = %d; want the renewed %d", cached, renewed.Expires)
+	}
+}
+
+// Renewing every minute would be as bad as never renewing: a membership with
+// most of its lifetime ahead of it is left alone.
+func TestReconcileLeavesAMembershipWithTimeLeftAlone(t *testing.T) {
+	content := SessionMembership{
+		Application: applicationCall,
+		DeviceID:    "DEVICE",
+		CreatedTS:   time.Now().UnixMilli(),
+		Expires:     membershipExpiry.Milliseconds(),
+	}
+	onTheServer := content
+	room := &stateRoom{current: &onTheServer}
+	m := joinedMembership(room.client(t))
+	m.content = &content
+
+	m.reconcile(context.Background())
+
+	if room.publishedCount() != 0 {
+		t.Errorf("re-published %d memberships; want none while ours has hours left", room.publishedCount())
+	}
+}
+
+// A membership that went missing after its lifetime ran out must come back
+// alive. Re-sending it verbatim would republish something every client reads
+// as already expired.
+func TestReconcileRepublishesAMissingMembershipWithALiveExpiry(t *testing.T) {
+	room := &stateRoom{}
+	m := joinedMembership(room.client(t))
+	m.content.CreatedTS = time.Now().Add(-6 * time.Hour).UnixMilli()
+	m.content.Expires = (4 * time.Hour).Milliseconds()
+
+	m.reconcile(context.Background())
+
+	if room.publishedCount() != 1 {
+		t.Fatalf("published %d memberships; want the missing one re-sent", room.publishedCount())
+	}
+	republished := room.published[0]
+	if isExpired(&event.Event{}, &republished) {
+		t.Errorf("re-published a membership that expired at %d; now is %d",
+			republished.CreatedTS+republished.Expires, time.Now().UnixMilli())
 	}
 }
 
