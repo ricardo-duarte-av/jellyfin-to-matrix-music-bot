@@ -398,37 +398,140 @@ func (b *Bot) sweepStickyMemberships(ctx context.Context) {
 	}
 }
 
-// followAudience pauses playback while the bot is alone in the call and picks
-// it up again when someone joins.
+// callEnterTimeout bounds joining the call: a fresh OpenID token and a LiveKit
+// JWT per dialect, then the handshakes. callLeaveTimeout bounds the way out,
+// which is a state event and a delayed event.
+const (
+	callEnterTimeout = 60 * time.Second
+	callLeaveTimeout = 15 * time.Second
+)
+
+// followAudience keeps the bot's presence in step with the audience: it pauses
+// and leaves once the last listener has gone, and rejoins and picks up where it
+// left off when somebody comes back.
 //
 // It runs after every membership change rather than on a timer: the watcher
 // already knows who is in the call, so this is only a question asked of state
 // that has just been updated.
 func (b *Bot) followAudience(ctx context.Context) {
-	if !b.cfg.Player.PausesWhenAlone() {
+	if !b.cfg.RTC.LeavesWhenAlone() {
 		return
 	}
+	b.audience.Lock()
+	defer b.audience.Unlock()
+
 	if b.calls.anyoneElse(b.client.UserID, time.Now()) {
+		b.cancelLeaveLocked()
+		b.enterCall(ctx)
 		b.resumeForAudience(ctx)
 		return
 	}
 	b.pauseForEmptyCall(ctx)
+	b.scheduleLeaveLocked()
+}
+
+// enterCall brings the bot back into the call for an audience that has just
+// arrived. Getting in is what makes the resume that follows audible, so a
+// failure is reported rather than swallowed: the bot would otherwise play to a
+// room it is not in.
+func (b *Bot) enterCall(ctx context.Context) {
+	if b.call == nil || b.call.Joined() {
+		return
+	}
+	enterCtx, cancel := context.WithTimeout(ctx, callEnterTimeout)
+	defer cancel()
+	if err := b.call.Enter(enterCtx); err != nil {
+		b.client.Log.Err(err).Msg("could not rejoin the call")
+		b.send(ctx, "Somebody joined the call but I could not get in. I will try again the next time somebody joins.", "")
+	}
+}
+
+// scheduleLeaveLocked starts the countdown out of an empty call. Caller must
+// hold b.audience.
+//
+// The wait is the point. A client that drops and comes straight back — a phone
+// locking, a network handover — would otherwise cost a full rejoin each time,
+// and each rejoin is a fresh OpenID token, a fresh LiveKit JWT, a membership
+// and a delayed event.
+func (b *Bot) scheduleLeaveLocked() {
+	if b.call == nil || !b.call.Joined() || b.leaveTimer != nil {
+		return
+	}
+	linger := b.cfg.RTC.Linger
+	b.leaveTimer = time.AfterFunc(linger, b.leaveEmptyCall)
+	b.client.Log.Info().Dur("linger", linger).Msg("call is empty; leaving it unless somebody comes back")
+}
+
+// cancelLeaveLocked calls off a pending departure. Caller must hold b.audience.
+func (b *Bot) cancelLeaveLocked() {
+	if b.leaveTimer == nil {
+		return
+	}
+	b.leaveTimer.Stop()
+	b.leaveTimer = nil
+	b.client.Log.Info().Msg("somebody came back before the call emptied out; staying in it")
+}
+
+// leaveEmptyCall takes the bot out of a call that stayed empty for the whole
+// linger.
+//
+// The audience is asked again rather than assumed. This runs on the timer's own
+// goroutine, and Stop cannot un-fire a timer that is already running, so the
+// answer at the moment of leaving is the only one that counts — which is why it
+// is read under the same lock the join path takes.
+func (b *Bot) leaveEmptyCall() {
+	b.audience.Lock()
+	defer b.audience.Unlock()
+	b.leaveTimer = nil
+
+	if b.call == nil || !b.call.Joined() || b.calls.anyoneElse(b.client.UserID, time.Now()) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callLeaveTimeout)
+	defer cancel()
+	if err := b.call.Leave(ctx); err != nil {
+		b.client.Log.Err(err).Msg("could not leave the empty call")
+	}
 }
 
 // pauseForEmptyCall holds playback once the last listener has gone.
 func (b *Bot) pauseForEmptyCall(ctx context.Context) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// Pause reports whether it actually stopped anything, which makes this
-	// idempotent: nothing playing, or already paused, and there is nothing to
-	// do. It deliberately does not consult autoPaused — playback started while
-	// the call was empty should still be held at the next membership change.
-	if !b.playback.Pause() {
+	if !b.holdPlayback() {
 		return
 	}
-	b.autoPaused = true
 	b.client.Log.Info().Msg("nobody left in the call; pausing playback")
 	b.send(ctx, "Nobody is left in the call — pausing. I will pick up where I left off when someone joins.", "")
+}
+
+// holdForEmptyCall pauses playback that has just been started into a call with
+// nobody in it, and reports whether it did.
+//
+// Starting a track is the one moment the empty-call rules are not reached by a
+// membership change, and without this the bot would stream a whole queue to
+// nobody — or, once it has left the call, into a suspended connection — until
+// the next time somebody joined or left.
+func (b *Bot) holdForEmptyCall() bool {
+	if !b.cfg.RTC.LeavesWhenAlone() || b.calls.anyoneElse(b.client.UserID, time.Now()) {
+		return false
+	}
+	return b.holdPlayback()
+}
+
+// holdPlayback pauses on the bot's own account and reports whether it stopped
+// anything.
+//
+// Pause reporting whether it changed anything is what makes this idempotent:
+// nothing playing, or already paused, and there is nothing to do. It
+// deliberately does not consult autoPaused — playback started while the call
+// was empty should still be held.
+func (b *Bot) holdPlayback() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.playback.Pause() {
+		return false
+	}
+	b.autoPaused = true
+	return true
 }
 
 // resumeForAudience undoes a pause the empty call caused. A pause somebody

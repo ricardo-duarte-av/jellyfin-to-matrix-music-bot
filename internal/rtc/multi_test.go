@@ -328,3 +328,127 @@ func TestCloseStopsReconnecting(t *testing.T) {
 		t.Errorf("dial attempts went from %d to %d after Close", settled, got)
 	}
 }
+
+// Leaving the call has to actually drop the connections — the whole point is
+// not to hold an SFU connection open for nobody.
+func TestSuspendClosesEveryLeg(t *testing.T) {
+	a, b := &fakeLeg{}, &fakeLeg{}
+	m, _ := testMulti(a, b)
+
+	m.Suspend()
+
+	if _, _, _, closed := a.counts(); !closed {
+		t.Error("first leg was left connected")
+	}
+	if _, _, _, closed := b.counts(); !closed {
+		t.Error("second leg was left connected")
+	}
+}
+
+// A frame still in flight from the encoder when the bot leaves is not the call
+// falling apart, so it must not be reported as such: the player is paused by
+// the same rule that suspended this, and an error here would look like every
+// connection having died.
+func TestWritesAreDroppedWhileSuspended(t *testing.T) {
+	a := &fakeLeg{}
+	m, _ := testMulti(a)
+
+	m.Suspend()
+
+	if err := m.WriteOpus([]byte{1}); err != nil {
+		t.Errorf("WriteOpus() while suspended = %v; want the frame dropped quietly", err)
+	}
+	if frames := a.frameCount(); frames != 0 {
+		t.Errorf("a suspended leg took %d frames; want none", frames)
+	}
+}
+
+// Rejoining has to put back everything the tile needs, or the bot comes back as
+// a blank square: a new connection has no video track and nothing on it.
+func TestResumeReconnectsAndRestoresTheTile(t *testing.T) {
+	fresh := &fakeLeg{identity: "back"}
+	m, _ := testMultiDial(func(context.Context) (publisherLeg, error) { return fresh, nil }, &fakeLeg{})
+	if err := m.PublishVideo("Jukebox"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ShowImage([]byte{9}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.Suspend()
+	if err := m.Resume(context.Background()); err != nil {
+		t.Fatalf("Resume() = %v", err)
+	}
+
+	if err := m.WriteOpus([]byte{1}); err != nil {
+		t.Fatalf("WriteOpus() after resuming = %v", err)
+	}
+	frames, images, videos, _ := fresh.counts()
+	if frames != 1 {
+		t.Errorf("the reconnected leg took %d frames; want 1", frames)
+	}
+	if videos != 1 {
+		t.Errorf("republished the video track %d times; want 1", videos)
+	}
+	if images != 1 {
+		t.Errorf("restored the album art %d times; want 1", images)
+	}
+}
+
+// A resumption that cannot get in anywhere leaves the bot out of the call
+// rather than half in it: the caller gives up on entering, and nothing must be
+// left redialling behind its back.
+func TestResumeThatConnectsNowhereStaysSuspended(t *testing.T) {
+	m, _ := testMultiDial(func(context.Context) (publisherLeg, error) {
+		return nil, errors.New("no token for you")
+	}, &fakeLeg{})
+
+	m.Suspend()
+	if err := m.Resume(context.Background()); err == nil {
+		t.Fatal("Resume() = nil with every leg refusing to connect")
+	}
+
+	m.mu.Lock()
+	suspended := m.suspended
+	m.mu.Unlock()
+	if !suspended {
+		t.Error("a resumption that connected nowhere left the publisher live")
+	}
+}
+
+// The bot can leave the call while a reconnect is still in flight — the SFU
+// dropped, the redial loop is mid-dial, and the last listener walks out. The
+// connection that arrives afterwards belongs to a call the bot is no longer in.
+func TestARedialInFlightDoesNotSurviveSuspension(t *testing.T) {
+	dialed := make(chan struct{})
+	release := make(chan struct{})
+	late := &fakeLeg{identity: "late"}
+	m, wrapped := testMultiDial(func(context.Context) (publisherLeg, error) {
+		close(dialed)
+		<-release
+		return late, nil
+	}, &fakeLeg{})
+
+	// Drop the connection so the redial loop starts, and wait until it is
+	// actually inside the dial.
+	wrapped[0].pub.(*fakeLeg).drop()
+	select {
+	case <-dialed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the redial never started")
+	}
+
+	m.Suspend()
+	close(release)
+
+	waitFor(t, "the late connection to be discarded", func() bool {
+		_, _, _, closed := late.counts()
+		return closed
+	})
+	m.mu.Lock()
+	adopted := wrapped[0].pub
+	m.mu.Unlock()
+	if adopted != nil {
+		t.Error("a connection dialled before the bot left was adopted after it")
+	}
+}

@@ -96,7 +96,23 @@ type RTC struct {
 	// SlotID is the MatrixRTC slot to join. The default is the room-wide call
 	// every calling client uses.
 	SlotID string `yaml:"slot_id"`
+	// LeaveWhenAlone pauses playback and leaves the call when the last
+	// listener goes, rejoining and picking up where it left off when somebody
+	// comes back. Off, the bot sits in the call for as long as it runs, which
+	// keeps the room showing an ongoing call and holds two SFU connections
+	// open for nobody. It is a pointer so an explicit "false" is
+	// distinguishable from the key being absent.
+	LeaveWhenAlone *bool `yaml:"leave_when_alone"`
+	// Linger is how long an empty call is given to refill before the bot
+	// leaves it. It exists for the client that drops and comes straight back —
+	// a phone locking, a network handover — which would otherwise cost a full
+	// rejoin: a fresh OpenID token, a fresh LiveKit JWT, a membership and a
+	// delayed event, every time.
+	Linger time.Duration `yaml:"linger"`
 }
+
+// LeavesWhenAlone reports whether the bot leaves a call that has emptied out.
+func (r RTC) LeavesWhenAlone() bool { return r.LeaveWhenAlone == nil || *r.LeaveWhenAlone }
 
 // MatrixRTC stack selections.
 const (
@@ -125,15 +141,7 @@ type Player struct {
 	ResultTTL   time.Duration `yaml:"result_ttl"`
 	MaxQueue    int           `yaml:"max_queue"`
 	FFmpegPath  string        `yaml:"ffmpeg_path"`
-	// PauseWhenAlone pauses playback when the last listener leaves the call
-	// and resumes it when someone joins, rather than streaming to an empty
-	// room. It is a pointer so an explicit "false" is distinguishable from the
-	// key being absent.
-	PauseWhenAlone *bool `yaml:"pause_when_alone"`
 }
-
-// PausesWhenAlone reports whether playback follows the call being empty.
-func (p Player) PausesWhenAlone() bool { return p.PauseWhenAlone == nil || *p.PauseWhenAlone }
 
 // Load reads, defaults and validates the config file at path.
 func Load(path string) (*Config, error) {
@@ -172,6 +180,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RTC.SlotID == "" {
 		c.RTC.SlotID = "m.call#ROOM"
+	}
+	if c.RTC.Linger <= 0 {
+		c.RTC.Linger = 45 * time.Second
 	}
 	if c.Player.SearchLimit <= 0 {
 		c.Player.SearchLimit = 10

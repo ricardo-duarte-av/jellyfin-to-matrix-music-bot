@@ -35,7 +35,10 @@ type Bot struct {
 	artwork  *artworkCache
 	calls    *callWatcher
 	// art renders the in-call video tile; nil when video is not published.
-	art    ArtPublisher
+	art ArtPublisher
+	// call is the bot's presence in the call, entered and left as an audience
+	// comes and goes. Nil leaves the bot wherever it already is.
+	call   call
 	roomID id.RoomID
 	// startedAt drops events from before the bot came up, so a restart does not
 	// replay old commands.
@@ -47,7 +50,32 @@ type Bot struct {
 	// autoPaused records that the empty call, rather than a person, paused
 	// playback. Only a pause the bot made itself is undone automatically.
 	autoPaused bool
+
+	// audience serialises the decisions taken about the audience, which are
+	// reached from three goroutines: the sync loop, the sticky expiry sweep and
+	// the linger timer. Without it a join landing as the timer fires could be
+	// followed by the leave it should have cancelled. It is taken before mu,
+	// never after.
+	audience sync.Mutex
+	// leaveTimer is the pending departure from an empty call, or nil when the
+	// bot is not on its way out.
+	leaveTimer *time.Timer
 }
+
+// call is the bot's presence in the call: the memberships that announce it and
+// the connections behind them.
+type call interface {
+	// Enter joins the call, connecting and publishing the memberships.
+	Enter(ctx context.Context) error
+	// Leave retracts the memberships and disconnects.
+	Leave(ctx context.Context) error
+	// Joined reports whether the bot is in the call now.
+	Joined() bool
+}
+
+// SetCall attaches the call the bot comes and goes from. Without it the bot
+// stays wherever it was put, pausing and resuming but never leaving.
+func (b *Bot) SetCall(c call) { b.call = c }
 
 // playback is the slice of the player that the empty-call rules drive. Both
 // methods report whether they changed anything.
@@ -126,6 +154,11 @@ func (b *Bot) Run(ctx context.Context) error {
 	// replays that same state, and without this the bot would announce every
 	// existing participant as a fresh arrival on every restart.
 	b.primeCallWatcher(ctx)
+	// Priming is silent by design, so it produces no membership change for the
+	// audience rules to react to — and a bot that starts up while a call is
+	// already going would sit outside it until somebody happened to join or
+	// leave. Ask the question once, now that the room has been read.
+	b.followAudience(ctx)
 	b.advertiseCommands(ctx)
 
 	go b.sweepStickyMembershipsUntil(ctx)
@@ -164,6 +197,10 @@ func (b *Bot) primeStickyOnFirstSync(syncer mautrix.ExtensibleSyncer) {
 		syncs++
 		if syncs == 2 {
 			b.calls.primeSticky()
+			// Sticky memberships were invisible until this point, so an
+			// audience made up entirely of sticky clients has only just
+			// appeared. Same reasoning as after priming the room state.
+			b.followAudience(ctx)
 		}
 		return true
 	})
@@ -396,6 +433,9 @@ func (b *Bot) cmdPlay(ctx context.Context, cmd Command) {
 	// with artwork; only mention what that message cannot convey.
 	added, truncated := b.player.PlayNow(tracks)
 	var extras []string
+	if b.holdForEmptyCall() {
+		extras = append(extras, "nobody is in the call, so I will start when someone joins")
+	}
 	if added > 1 {
 		extras = append(extras, fmt.Sprintf("queued %d more after it", added-1))
 	}
@@ -431,6 +471,9 @@ func (b *Bot) cmdQueue(ctx context.Context, cmd Command) {
 	if wasIdle {
 		if current := b.player.Status().Current; current != nil {
 			msg += " Now playing: " + current.Describe()
+		}
+		if b.holdForEmptyCall() {
+			msg += " Nobody is in the call, so I will start when someone joins."
 		}
 	}
 	b.reply(ctx, msg, "")

@@ -1,11 +1,17 @@
 package rtc
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -201,4 +207,55 @@ func TestStickyRankIsLastToExpire(t *testing.T) {
 	if lateScore <= earlyScore {
 		t.Errorf("StickyRank: %d (10m) should beat %d (1m)", lateScore, earlyScore)
 	}
+}
+
+// A rejoin is a new membership, not the old one coming back. The LiveKit
+// identity is derived from the member ID, so reusing it after a leave would
+// have the bot claim an identity its own leave event has just retired — and
+// clients that still hold the old entry would see two of it.
+func TestMemberIDIsRenewedOnRejoin(t *testing.T) {
+	client := acceptEverything(t)
+	m, err := NewStickyMembership(client, "!room:example.org", DefaultSlotID, DefaultStickyDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if err := m.Join(ctx); err != nil {
+		t.Fatalf("Join() = %v", err)
+	}
+	first := m.MemberID()
+	if err := m.Leave(ctx); err != nil {
+		t.Fatalf("Leave() = %v", err)
+	}
+	if got := m.MemberID(); got != first {
+		t.Errorf("member id changed on leaving, to %q; the leave has to name the membership it retracts", got)
+	}
+
+	if err := m.Join(ctx); err != nil {
+		t.Fatalf("rejoin = %v", err)
+	}
+	if m.MemberID() == first {
+		t.Errorf("rejoined as member id %q; want a fresh one", first)
+	}
+	if err := m.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// acceptEverything is a homeserver that takes any event and returns an ID for
+// it, with no delayed-event support — the path a homeserver without MSC4140
+// puts the bot on.
+func acceptEverything(t *testing.T) *mautrix.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"event_id": "$sent"})
+	}))
+	t.Cleanup(srv.Close)
+	client, err := mautrix.NewClient(srv.URL, "@bot:example.org", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Log = zerolog.New(io.Discard)
+	return client
 }

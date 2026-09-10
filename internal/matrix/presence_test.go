@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -282,9 +283,71 @@ func (f *fakePlayback) Resume() bool {
 	return true
 }
 
+// fakeCall is the bot's presence in the call as the audience rules see it.
+type fakeCall struct {
+	mu       sync.Mutex
+	joined   bool
+	enters   int
+	leaves   int
+	enterErr error
+	// left is signalled on every departure, so a test can wait for the linger
+	// to run out instead of sleeping for it.
+	left chan struct{}
+}
+
+func newFakeCall(joined bool) *fakeCall {
+	return &fakeCall{joined: joined, left: make(chan struct{}, 4)}
+}
+
+func (f *fakeCall) Enter(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.enters++
+	if f.enterErr != nil {
+		return f.enterErr
+	}
+	f.joined = true
+	return nil
+}
+
+func (f *fakeCall) Leave(context.Context) error {
+	f.mu.Lock()
+	f.leaves++
+	f.joined = false
+	f.mu.Unlock()
+	f.left <- struct{}{}
+	return nil
+}
+
+func (f *fakeCall) Joined() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.joined
+}
+
+func (f *fakeCall) counts() (enters, leaves int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enters, f.leaves
+}
+
+// awaitLeave waits for the linger to run out, or fails the test.
+func (f *fakeCall) awaitLeave(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.left:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the bot never left the empty call")
+	}
+}
+
+// testLinger is short enough to wait out in a test and long enough not to fire
+// while a test is still setting up.
+const testLinger = 30 * time.Millisecond
+
 // audienceBot is a bot with just enough wired up to run the empty-call rules,
 // pointed at a homeserver that swallows whatever it announces.
-func audienceBot(t *testing.T, pause bool) (*Bot, *fakePlayback) {
+func audienceBot(t *testing.T, leave bool) (*Bot, *fakePlayback, *fakeCall) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -298,20 +361,25 @@ func audienceBot(t *testing.T, pause bool) (*Bot, *fakePlayback) {
 	client.Log = zerolog.New(io.Discard)
 
 	play := &fakePlayback{playing: true}
+	call := newFakeCall(true)
 	return &Bot{
-		cfg:      &config.Config{Player: config.Player{PauseWhenAlone: &pause}},
+		cfg: &config.Config{RTC: config.RTC{
+			LeaveWhenAlone: &leave,
+			Linger:         testLinger,
+		}},
 		client:   client,
 		playback: play,
+		call:     call,
 		calls:    primedWatcher(),
 		roomID:   "!room:example.org",
-	}, play
+	}, play, call
 }
 
 // The point of the whole thing: an empty call stops the music, and someone
 // arriving starts it again.
 func TestPlaybackFollowsTheAudience(t *testing.T) {
 	ctx := context.Background()
-	b, play := audienceBot(t, true)
+	b, play, _ := audienceBot(t, true)
 
 	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
 	b.followAudience(ctx)
@@ -343,7 +411,7 @@ func TestPlaybackFollowsTheAudience(t *testing.T) {
 // start the music behind their back.
 func TestManualPauseSurvivesSomeoneJoining(t *testing.T) {
 	ctx := context.Background()
-	b, play := audienceBot(t, true)
+	b, play, _ := audienceBot(t, true)
 
 	// Someone pauses by hand, then joins the call.
 	b.clearAutoPause()
@@ -358,13 +426,118 @@ func TestManualPauseSurvivesSomeoneJoining(t *testing.T) {
 }
 
 // The whole behaviour is opt-out.
-func TestPauseWhenAloneCanBeTurnedOff(t *testing.T) {
+func TestLeaveWhenAloneCanBeTurnedOff(t *testing.T) {
 	ctx := context.Background()
-	b, play := audienceBot(t, false)
+	b, play, _ := audienceBot(t, false)
 
 	b.followAudience(ctx)
 
 	if !play.playing || play.pauses != 0 {
-		t.Errorf("paused %d times with pause_when_alone off; want none", play.pauses)
+		t.Errorf("paused %d times with leave_when_alone off; want none", play.pauses)
+	}
+}
+
+// Staying in a call nobody is in costs two SFU connections and leaves the room
+// showing a call in progress for as long as the bot runs. So it leaves.
+func TestBotLeavesACallItIsAloneIn(t *testing.T) {
+	ctx := context.Background()
+	b, play, call := audienceBot(t, true)
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", false)
+	b.followAudience(ctx)
+
+	if play.playing {
+		t.Error("still playing to an empty call")
+	}
+	call.awaitLeave(t)
+	if _, leaves := call.counts(); leaves != 1 {
+		t.Errorf("left %d times; want 1", leaves)
+	}
+}
+
+// The linger is the whole point of the delay: a client that drops and comes
+// straight back must not cost a full rejoin.
+func TestSomebodyComingBackCancelsTheDeparture(t *testing.T) {
+	ctx := context.Background()
+	b, _, call := audienceBot(t, true)
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", false)
+	b.followAudience(ctx)
+	// Back before the linger runs out.
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+
+	time.Sleep(4 * testLinger)
+	enters, leaves := call.counts()
+	if leaves != 0 {
+		t.Errorf("left the call %d times; want none, the listener came back", leaves)
+	}
+	if enters != 0 {
+		t.Errorf("rejoined %d times; want none, it never left", enters)
+	}
+}
+
+// Once out of the call, the bot has to get back in before it can be heard —
+// resuming playback into a connection it no longer holds would be silence.
+func TestBotRejoinsWhenSomebodyArrives(t *testing.T) {
+	ctx := context.Background()
+	b, play, call := audienceBot(t, true)
+	call.joined = false
+	play.Pause()
+	b.autoPaused = true
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	b.followAudience(ctx)
+
+	enters, _ := call.counts()
+	if enters != 1 {
+		t.Fatalf("entered the call %d times; want 1", enters)
+	}
+	if !call.Joined() {
+		t.Error("not in the call after somebody joined it")
+	}
+	if !play.playing {
+		t.Error("playback did not resume for the listener that just arrived")
+	}
+}
+
+// A !play typed into a room where nobody is in the call must not stream a whole
+// queue to an audience of nobody: there is no membership change coming to stop
+// it, since nothing about the call has changed.
+func TestPlayIntoAnEmptyCallIsHeld(t *testing.T) {
+	b, play, _ := audienceBot(t, true)
+
+	if !b.holdForEmptyCall() {
+		t.Fatal("holdForEmptyCall() = false with nobody in the call")
+	}
+	if play.playing {
+		t.Error("still playing into an empty call")
+	}
+
+	// With a listener there it is somebody else's music, and holding it would
+	// be wrong.
+	play.Resume()
+	b.calls.applyLegacy(bob, "_@bob:example.org_PHONE", true)
+	if b.holdForEmptyCall() {
+		t.Error("held playback with a listener in the call")
+	}
+}
+
+// The bot leaves the call it is in when told to stop watching the audience is
+// not the same as never having been in one: with the behaviour off, an empty
+// call changes nothing at all.
+func TestNothingHappensWithLeavingTurnedOff(t *testing.T) {
+	ctx := context.Background()
+	b, _, call := audienceBot(t, false)
+
+	b.followAudience(ctx)
+	time.Sleep(4 * testLinger)
+
+	if enters, leaves := call.counts(); enters != 0 || leaves != 0 {
+		t.Errorf("entered %d and left %d times with leave_when_alone off; want none", enters, leaves)
 	}
 }
