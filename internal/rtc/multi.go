@@ -49,11 +49,22 @@ type MultiPublisher struct {
 	videoName string
 	keyframe  []byte
 	closed    bool
+	// suspended is set while the bot is deliberately out of the call. It is
+	// not the same as every leg being dead: a dead leg is a failure to undo,
+	// and something is redialling it.
+	suspended bool
+	// epoch counts suspensions and resumptions. A redial that was in flight
+	// when the bot left the call must not put its connection back into a
+	// fan-out that has moved on, and it cannot tell that from the leg alone.
+	epoch int
 	// backoff overrides the wait between reconnect attempts; nil means
 	// redialWait. Only tests set it.
 	backoff func(attempt int) time.Duration
 	// done interrupts a backoff wait at shutdown.
 	done chan struct{}
+	// halt interrupts a backoff wait when the bot leaves the call. Unlike done
+	// it is replaced on every resumption.
+	halt chan struct{}
 }
 
 // publisherLeg is the part of *Publisher that MultiPublisher drives. Naming it
@@ -99,7 +110,7 @@ type NamedPublisher struct {
 // Nil publishers are skipped, so callers can pass a leg that was never
 // established without checking first.
 func NewMultiPublisher(log zerolog.Logger, publishers ...NamedPublisher) *MultiPublisher {
-	m := &MultiPublisher{log: log, done: make(chan struct{})}
+	m := &MultiPublisher{log: log, done: make(chan struct{}), halt: make(chan struct{})}
 	for _, p := range publishers {
 		if p.Publisher == nil {
 			continue
@@ -114,9 +125,31 @@ func NewMultiPublisher(log zerolog.Logger, publishers ...NamedPublisher) *MultiP
 	return m
 }
 
+// NewIdleMultiPublisher groups legs that have not been connected yet. It starts
+// suspended, and Resume is what dials them.
+//
+// It exists so the bot can be built without being in the call: the player, the
+// artwork and the commands all hold this object for the life of the process,
+// while the connections behind it come and go with the audience.
+func NewIdleMultiPublisher(log zerolog.Logger, publishers ...NamedPublisher) *MultiPublisher {
+	m := &MultiPublisher{log: log, done: make(chan struct{}), halt: make(chan struct{}), suspended: true}
+	for _, p := range publishers {
+		if p.Dial == nil {
+			continue
+		}
+		dial := p.Dial
+		m.legs = append(m.legs, &leg{
+			name: p.Name,
+			dead: true,
+			dial: func(ctx context.Context) (publisherLeg, error) { return dial(ctx) },
+		})
+	}
+	return m
+}
+
 // newMultiPublisher is the same over anything shaped like a publisher.
 func newMultiPublisher(log zerolog.Logger, legs ...*leg) *MultiPublisher {
-	m := &MultiPublisher{log: log, done: make(chan struct{}), legs: legs}
+	m := &MultiPublisher{log: log, done: make(chan struct{}), halt: make(chan struct{}), legs: legs}
 	for _, l := range legs {
 		m.watch(l, l.pub)
 	}
@@ -134,7 +167,9 @@ func (m *MultiPublisher) watch(l *leg, pub publisherLeg) {
 // lost retires a leg and starts reconnecting it.
 func (m *MultiPublisher) lost(l *leg, cause error) {
 	m.mu.Lock()
-	if m.closed || l.dead {
+	if m.closed || m.suspended || l.dead {
+		// A connection dropping is expected while suspended — the bot closed
+		// it on the way out of the call — and there is nothing to heal.
 		m.mu.Unlock()
 		return
 	}
@@ -147,26 +182,30 @@ func (m *MultiPublisher) lost(l *leg, cause error) {
 // startRedialLocked launches the reconnect loop for a retired leg, unless one
 // is already running or the leg cannot be redialled. Caller must hold m.mu.
 func (m *MultiPublisher) startRedialLocked(l *leg) {
-	if m.closed || l.dial == nil || l.redialing {
+	if m.closed || m.suspended || l.dial == nil || l.redialing {
 		return
 	}
 	l.redialing = true
-	go m.redial(l)
+	go m.redial(l, m.epoch)
 }
 
 // redial reconnects a leg, backing off between attempts, until it succeeds or
 // the publisher is closed. It never gives up: the alternative is a bot that
 // looks like it is in the call for as long as it runs but cannot be heard.
-func (m *MultiPublisher) redial(l *leg) {
+func (m *MultiPublisher) redial(l *leg, epoch int) {
 	defer func() {
 		m.mu.Lock()
 		l.redialing = false
 		m.mu.Unlock()
 	}()
 
+	halt := m.haltChan()
 	for attempt := 1; ; attempt++ {
 		select {
 		case <-m.done:
+			return
+		case <-halt:
+			// The bot left the call; this leg is no longer wanted.
 			return
 		case <-time.After(m.waitFor(attempt)):
 		}
@@ -179,8 +218,8 @@ func (m *MultiPublisher) redial(l *leg) {
 				Msg("could not reconnect to livekit; will retry")
 			continue
 		}
-		if !m.adopt(l, pub) {
-			// Closed while we were dialling.
+		if !m.adopt(l, pub, epoch) {
+			// Closed, or left the call, while we were dialling.
 			pub.Close()
 			return
 		}
@@ -212,9 +251,9 @@ func redialWait(attempt int) time.Duration {
 
 // adopt puts a fresh connection back into the fan-out and restores the video
 // track it missed. It reports false if the publisher closed meanwhile.
-func (m *MultiPublisher) adopt(l *leg, pub publisherLeg) bool {
+func (m *MultiPublisher) adopt(l *leg, pub publisherLeg, epoch int) bool {
 	m.mu.Lock()
-	if m.closed {
+	if m.closed || m.epoch != epoch {
 		m.mu.Unlock()
 		return false
 	}
@@ -249,6 +288,9 @@ func (m *MultiPublisher) WriteOpus(frame []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.suspended {
+		return nil
+	}
 	alive := 0
 	for _, l := range m.legs {
 		if l.dead {
@@ -316,6 +358,104 @@ func (m *MultiPublisher) PublishVideo(name string) error {
 	return nil
 }
 
+// haltChan is the current suspension signal.
+func (m *MultiPublisher) haltChan() chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.halt
+}
+
+// Suspend drops every connection and stops trying to get them back, for a bot
+// that is deliberately leaving the call.
+//
+// Being suspended is not being broken, so writes are dropped rather than
+// failed: the player is paused by the same rule that suspended this, and a
+// frame still in flight from the encoder must not look like the call falling
+// apart.
+func (m *MultiPublisher) Suspend() {
+	m.mu.Lock()
+	if m.closed || m.suspended {
+		m.mu.Unlock()
+		return
+	}
+	m.suspended = true
+	m.epoch++
+	close(m.halt)
+
+	pubs := make([]publisherLeg, 0, len(m.legs))
+	for _, l := range m.legs {
+		if l.pub != nil {
+			pubs = append(pubs, l.pub)
+		}
+		l.pub, l.dead = nil, true
+	}
+	m.mu.Unlock()
+
+	for _, pub := range pubs {
+		pub.Close()
+	}
+	m.log.Info().Msg("disconnected from livekit")
+}
+
+// Resume reconnects every leg, and restores the video track and the still that
+// were up when the bot left.
+//
+// A leg that will not come back now is handed to the ordinary redial loop
+// rather than failing the resumption: one dialect being slow to let the bot in
+// should not keep it out of the call on the other. Only failing on every leg is
+// an error, and that leaves the publisher suspended again rather than half-up.
+func (m *MultiPublisher) Resume(ctx context.Context) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("publisher is closed")
+	}
+	if !m.suspended {
+		m.mu.Unlock()
+		return nil
+	}
+	m.suspended = false
+	m.epoch++
+	m.halt = make(chan struct{})
+	epoch, legs := m.epoch, append([]*leg(nil), m.legs...)
+	m.mu.Unlock()
+
+	var failed []string
+	live := 0
+	for _, l := range legs {
+		if l.dial == nil {
+			continue
+		}
+		pub, err := l.dial(ctx)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", l.name, err))
+			m.mu.Lock()
+			m.startRedialLocked(l)
+			m.mu.Unlock()
+			continue
+		}
+		if !m.adopt(l, pub, epoch) {
+			pub.Close()
+			return fmt.Errorf("left the call again while reconnecting")
+		}
+		live++
+	}
+	if live == 0 {
+		// Nothing came up, so there is nothing to keep: suspending again stops
+		// the redial loops this just started, leaving the caller free to give
+		// up on entering the call rather than half-entering it.
+		m.Suspend()
+		return fmt.Errorf("could not connect to livekit: %s", strings.Join(failed, "; "))
+	}
+	if len(failed) > 0 {
+		// One dialect being slow to let the bot in must not keep it out on the
+		// other; the redial loop has those legs.
+		m.log.Warn().Strs("errors", failed).Int("connected", live).
+			Msg("connected on some livekit legs but not all; retrying the rest")
+	}
+	return nil
+}
+
 // Identity lists the LiveKit identities in use, one per connection.
 func (m *MultiPublisher) Identity() string {
 	m.mu.Lock()
@@ -323,6 +463,9 @@ func (m *MultiPublisher) Identity() string {
 
 	parts := make([]string, 0, len(m.legs))
 	for _, l := range m.legs {
+		if l.pub == nil {
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%s=%s", l.name, l.pub.Identity()))
 	}
 	return strings.Join(parts, " ")
@@ -340,6 +483,8 @@ func (m *MultiPublisher) Close() {
 	m.mu.Unlock()
 
 	for _, l := range legs {
-		l.pub.Close()
+		if l.pub != nil {
+			l.pub.Close()
+		}
 	}
 }

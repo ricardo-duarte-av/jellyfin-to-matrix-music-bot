@@ -44,6 +44,17 @@ rtc:
   # client uses; change it only if you know you need a separate session.
   slot_id: "m.call#ROOM"
 
+  # Pause and leave the call when the last listener goes, rejoining and picking
+  # up where it left off when somebody comes back. Set to false to sit in the
+  # call for as long as the bot runs, which keeps the room showing a call in
+  # progress and holds an SFU connection per dialect open for nobody.
+  leave_when_alone: true
+
+  # How long an empty call is given to refill before the bot leaves it. It is
+  # there for the client that drops and comes straight back — a phone locking,
+  # a network handover — which would otherwise cost a full rejoin each time.
+  linger: 45s
+
 jellyfin:
   server: http://jellyfin.local:8096
   api_key: "..."
@@ -55,9 +66,6 @@ player:
   result_ttl: 10m
   max_queue: 200
   ffmpeg_path: ffmpeg
-  # Pause when the last listener leaves the call, and resume when someone
-  # joins again. Set to false to keep streaming to an empty call.
-  pause_when_alone: true
 
 audio:
   # Target bitrate for the Opus encode. The bot sends this rate constantly to

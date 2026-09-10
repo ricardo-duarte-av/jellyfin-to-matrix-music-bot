@@ -134,73 +134,72 @@ func run(configPath string) error {
 
 	membership := rtc.NewMembership(client, roomID, id.UserID(cfg.Matrix.UserID), deviceID)
 
-	serviceURL := cfg.RTC.LiveKitServiceURL
-	if transport, err := membership.ActiveTransport(ctx); err != nil {
-		client.Log.Warn().Err(err).Msg("could not inspect existing call memberships")
-	} else if transport != nil {
-		// Someone is already in the call; MatrixRTC clients all defer to the
-		// transport the oldest membership proposed.
-		serviceURL = transport.LiveKitServiceURL
-		client.Log.Info().Str("service", serviceURL).Msg("joining call on the existing focus")
-	}
-	if serviceURL == "" {
-		serviceURL, err = rtc.DiscoverService(ctx, cfg.Matrix.Homeserver)
+	// The service the bot would pick for itself, when there is no call in
+	// progress to defer to.
+	preferred := cfg.RTC.LiveKitServiceURL
+	if preferred == "" {
+		preferred, err = rtc.DiscoverService(ctx, cfg.Matrix.Homeserver)
 		if err != nil {
 			return err
 		}
-		client.Log.Info().Str("service", serviceURL).Msg("discovered MatrixRTC service")
+		client.Log.Info().Str("service", preferred).Msg("discovered MatrixRTC service")
+	}
+	focus := rtc.NewFocus(preferred)
+
+	// Which focus to join on is decided on every entry to the call rather than
+	// once at startup. The bot leaves a call that has emptied out, and the
+	// person who starts the next one picks the focus that MatrixRTC's "oldest
+	// membership wins" rule then puts everybody on — including the bot.
+	resolveFocus := func(ctx context.Context) (string, error) {
+		transport, err := membership.ActiveTransport(ctx)
+		if err != nil {
+			return focus.Preferred(), err
+		}
+		if transport != nil && transport.LiveKitServiceURL != "" {
+			return transport.LiveKitServiceURL, nil
+		}
+		return focus.Preferred(), nil
 	}
 
 	var legs []rtc.NamedPublisher
+	var members []rtc.CallMember
 	var alias string
 
 	if cfg.RTC.UsesLegacy() {
-		// dial is used both for the first connection and for every
-		// reconnection: the LiveKit token is minted from a single-use OpenID
-		// token, so getting back in after the SFU drops us means redoing the
-		// whole exchange, not reusing the JWT.
+		// dial is the whole join, and it runs on every entry to the call and
+		// every reconnection: the LiveKit token is minted from a single-use
+		// OpenID token, so getting back in never means reusing a JWT.
 		dial := func(ctx context.Context) (*rtc.Publisher, error) {
-			sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
+			sfu, err := rtc.GetSFUConfig(ctx, client, focus.ServiceURL(), roomID, deviceID, "", "", 0)
 			if err != nil {
 				return nil, fmt.Errorf("get livekit token: %w", err)
 			}
+			// The LiveKit room is only known once a token has been minted, and
+			// the membership published straight after this has to name it.
+			focus.SetAlias(sfu.Alias)
 			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
 		}
 
-		sfu, err := rtc.GetSFUConfig(ctx, client, serviceURL, roomID, deviceID, "", "", 0)
+		// A token minted at startup and then thrown away is worth one round
+		// trip: it fails a bad access token or an unreachable focus here,
+		// rather than at whatever hour the first listener turns up.
+		sfu, err := rtc.GetSFUConfig(ctx, client, focus.ServiceURL(), roomID, deviceID, "", "", 0)
 		if err != nil {
 			return fmt.Errorf("get livekit token: %w", err)
 		}
 		client.Log.Info().
 			Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).
 			Str("source", string(sfu.Source)).Msg("got livekit credentials")
-
-		if err := membership.Join(ctx, rtc.Transport{
-			Type:              rtc.TransportTypeLiveKit,
-			LiveKitServiceURL: serviceURL,
-			LiveKitAlias:      sfu.Alias,
-		}); err != nil {
-			return err
-		}
-		defer func() {
-			leaveCtx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
-			defer cancel()
-			if err := membership.Leave(leaveCtx); err != nil {
-				client.Log.Err(err).Msg("failed to leave call cleanly")
-			}
-		}()
+		focus.SetAlias(sfu.Alias)
 
 		// Watch the published membership, not just the delayed leave: the
 		// keeper only heals a leave the homeserver fired, and the membership
-		// can go missing without that.
+		// can go missing without that. It stands down while the bot is out of
+		// the call, so it costs nothing then.
 		go membership.Watch(ctx)
 
-		pub, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
-		if err != nil {
-			return err
-		}
-		defer pub.Close()
-		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Publisher: pub, Dial: dial})
+		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Dial: dial})
+		members = append(members, membership)
 		alias = sfu.Alias
 	}
 
@@ -218,7 +217,7 @@ func run(configPath string) error {
 		// LiveKit identity is derived from it, so a reconnection lands back on
 		// the same identity the published membership points at.
 		dial := func(ctx context.Context) (*rtc.Publisher, error) {
-			sfu, err := rtc.GetStickyToken(ctx, client, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+			sfu, err := rtc.GetStickyToken(ctx, client, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
 			if err != nil {
 				return nil, fmt.Errorf("get livekit token for sticky membership: %w", err)
 			}
@@ -228,7 +227,7 @@ func run(configPath string) error {
 			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
 		}
 
-		sfu, err := rtc.GetStickyToken(ctx, client, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+		sfu, err := rtc.GetStickyToken(ctx, client, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
 		switch {
 		case err != nil:
 			return fmt.Errorf("get livekit token for sticky membership: %w", err)
@@ -245,41 +244,46 @@ func run(configPath string) error {
 				Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).
 				Str("source", string(sfu.Source)).Msg("got livekit credentials for sticky membership")
 
-			if err := sticky.Join(ctx); err != nil {
-				return err
-			}
-			defer func() {
-				leaveCtx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
-				defer cancel()
-				if err := sticky.Leave(leaveCtx); err != nil {
-					client.Log.Err(err).Msg("failed to leave call cleanly on the sticky membership")
-				}
-			}()
-
-			pub, err := rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
-			if err != nil {
-				return err
-			}
-			defer pub.Close()
-			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Publisher: pub, Dial: dial})
+			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Dial: dial})
+			members = append(members, rtc.StickyMember(sticky))
 		}
 	}
 
 	if len(legs) == 0 {
 		return fmt.Errorf("no MatrixRTC connection established; check rtc.stack in config.yaml")
 	}
-	publisher := rtc.NewMultiPublisher(log, legs...)
+	// The publisher outlives any one visit to the call: the player, the
+	// artwork and the commands all hold it for the life of the process, while
+	// the connections behind it come and go with the audience.
+	publisher := rtc.NewIdleMultiPublisher(log, legs...)
 	// Closing the group is what stops the reconnect loops and disconnects
 	// whatever connection each leg is on now, which after a reconnection is no
-	// longer the one the per-leg defers above captured.
+	// longer the one it was first given.
 	defer publisher.Close()
+	call := rtc.NewSession(log, focus, publisher, resolveFocus, members...)
+	defer func() {
+		leaveCtx, cancel := context.WithTimeout(context.Background(), leaveTimeout)
+		defer cancel()
+		if err := call.Leave(leaveCtx); err != nil {
+			client.Log.Err(err).Msg("failed to leave call cleanly")
+		}
+	}()
 	client.Log.Info().
-		Str("identities", publisher.Identity()).
 		Str("bitrate", cfg.Audio.Bitrate).
 		Str("vbr", cfg.Audio.VBR).
 		Int("channels", cfg.Audio.Channels()).
 		Int("fec_packet_loss", cfg.Audio.FECPacketLoss).
-		Msg("connected to livekit and publishing")
+		Msg("ready to publish")
+
+	if cfg.RTC.LeavesWhenAlone() {
+		// The bot joins when the first listener does. Whether anybody is in the
+		// call already is a question for the watcher, which answers it as soon
+		// as it has read the room.
+		client.Log.Info().Dur("linger", cfg.RTC.Linger).
+			Msg("staying out of the call until somebody is in it")
+	} else if err := call.Enter(ctx); err != nil {
+		return err
+	}
 
 	// The album cover is published as a still video track, so the bot shows a
 	// picture in the call instead of an empty tile. It is decorative: if any
@@ -337,6 +341,7 @@ func run(configPath string) error {
 	defer plr.Close()
 
 	bot = matrix.New(cfg, client, jf, plr)
+	bot.SetCall(call)
 	if artPublisher != nil {
 		bot.SetArtPublisher(artPublisher)
 	}

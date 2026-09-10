@@ -93,9 +93,13 @@ type StickyMembership struct {
 	memberID string
 	duration time.Duration
 
-	mu       sync.Mutex
-	delayID  id.DelayID
-	joined   bool
+	mu      sync.Mutex
+	delayID id.DelayID
+	joined  bool
+	// left records that this membership has been used and given up, so the
+	// next join knows to mint a fresh member ID rather than reuse a retired
+	// one.
+	left     bool
 	keeper   *delayKeeper
 	stopRe   chan struct{}
 	reDone   chan struct{}
@@ -129,7 +133,14 @@ func NewStickyMembership(client *mautrix.Client, roomID id.RoomID, slotID string
 
 // MemberID is the member.id this membership publishes under. The LiveKit
 // identity is derived from it, so the token request must use the same value.
-func (m *StickyMembership) MemberID() string { return m.memberID }
+//
+// It changes when the bot rejoins a call it had left, so anything deriving an
+// identity from it must ask again on every join rather than hold onto it.
+func (m *StickyMembership) MemberID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.memberID
+}
 
 // refreshInterval is how often the membership is re-published. It sits well
 // ahead of expiry: MSC4143 asks clients to refresh early so the membership
@@ -144,6 +155,16 @@ func (m *StickyMembership) Join(ctx context.Context) error {
 	defer m.mu.Unlock()
 	if m.joined {
 		return nil
+	}
+	// A member ID identifies one join, not one client: a bot that left the call
+	// and is coming back is a new membership, and reusing the retired ID would
+	// have it claim the identity its own leave event just retired.
+	if m.left {
+		memberID, err := newMemberID()
+		if err != nil {
+			return err
+		}
+		m.memberID, m.left = memberID, false
 	}
 
 	// Arm the delayed leave first, for the same reason the session stack does:
@@ -173,7 +194,7 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	m.joined = false
+	m.joined, m.left = false, true
 	keeper, stopRe, reDone := m.keeper, m.stopRe, m.reDone
 	m.keeper, m.stopRe, m.reDone = nil, nil, nil
 	m.mu.Unlock()

@@ -61,23 +61,42 @@ lacks the power level to open an `m.rtc.slot` in the room.
 ## Nobody in the call
 
 When the last listener leaves, the bot pauses instead of streaming to an empty
-call, and resumes where it left off as soon as someone joins:
+call, and then leaves the call itself:
 
 ```
 [bob left the call.]
 Nobody is left in the call — pausing. I will pick up where I left off when someone joins.
-[bob joined the call.]
-Resuming.
+[the jukebox left the call.]
 ```
+
+It comes back — and picks up where it left off — as soon as somebody joins the
+call again. Sitting in a call nobody is in is not free: it holds an SFU
+connection open per dialect, and it leaves the room showing a call in progress
+for as long as the bot runs, which is what people actually notice.
+
+The bot waits out `rtc.linger` (45s by default) before going, so a client that
+drops and comes straight back — a phone locking, a network handover — does not
+cost a full rejoin: every rejoin is a fresh OpenID token, a fresh LiveKit JWT, a
+membership and a delayed event.
+
+Because the bot is not in the call between listeners, **`!play` into a room where
+nobody is in the call queues the music rather than playing it**, and says so. It
+starts when somebody joins. There is nothing to play into otherwise, and the
+music would be streamed to nobody.
+
+Leaving also puts the bot back where a MatrixRTC client should be in the
+pecking order. Everyone in a call is on the focus proposed by the oldest
+membership in it; a bot that never leaves is always the oldest, so it would
+impose its own focus on every call forever. Rejoining after the humans means it
+follows the focus the room agreed on.
 
 Only a pause the bot made itself is undone this way: a `!pause` somebody typed
 stays paused until they say otherwise. The bot's own membership never counts as
 an audience, and neither does a sticky membership that has lapsed — a client
-that crashed stops refreshing rather than sending a leave. Playback started with
-`!play` while the call is empty is left alone; the rule reacts to people
-leaving, not to the queue.
+that crashed stops refreshing rather than sending a leave.
 
-Set `player.pause_when_alone: false` to keep streaming regardless.
+Set `rtc.leave_when_alone: false` to keep the old behaviour of sitting in the
+call and streaming to it regardless.
 
 ## Staying in the call
 
@@ -90,7 +109,9 @@ Both halves of "being in a call" can fail on their own, so both are watched:
   LiveKit JWT), backing off from 2s to a minute, for as long as it takes. The
   identity it comes back on is the same one its published membership points at,
   and the album art track is republished with it.
-* **The membership.** The delayed leave is refreshed every 10s, and if the
+* **The membership.** All of this applies while the bot is in the call; between
+  listeners there is nothing to keep alive, and the loops below stand down.
+  The delayed leave is refreshed every 10s, and if the
   homeserver has forgotten it — which almost always means it published the
   leave — the bot rejoins and arms a new one. The legacy membership is also read
   back once a minute: re-published if it has gone missing some other way, and
