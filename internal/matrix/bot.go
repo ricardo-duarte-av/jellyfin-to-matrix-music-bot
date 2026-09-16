@@ -60,6 +60,11 @@ type Bot struct {
 	// leaveTimer is the pending departure from an empty call, or nil when the
 	// bot is not on its way out.
 	leaveTimer *time.Timer
+
+	// settleMu guards settleTimer, the pending decision on a burst of
+	// membership changes; see audienceChanged.
+	settleMu    sync.Mutex
+	settleTimer *time.Timer
 }
 
 // call is the bot's presence in the call: the memberships that announce it and
@@ -71,6 +76,9 @@ type call interface {
 	Leave(ctx context.Context) error
 	// Joined reports whether the bot is in the call now.
 	Joined() bool
+	// Reconcile moves a bot that is in the call onto the dialects the call now
+	// wants. It does nothing for a bot that is not in the call.
+	Reconcile(ctx context.Context) error
 }
 
 // SetCall attaches the call the bot comes and goes from. Without it the bot
@@ -159,6 +167,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	// already going would sit outside it until somebody happened to join or
 	// leave. Ask the question once, now that the room has been read.
 	b.followAudience(ctx)
+	b.followDialects(ctx)
 	b.advertiseCommands(ctx)
 
 	go b.sweepStickyMembershipsUntil(ctx)
@@ -200,7 +209,7 @@ func (b *Bot) primeStickyOnFirstSync(syncer mautrix.ExtensibleSyncer) {
 			// Sticky memberships were invisible until this point, so an
 			// audience made up entirely of sticky clients has only just
 			// appeared. Same reasoning as after priming the room state.
-			b.followAudience(ctx)
+			b.audienceChanged()
 		}
 		return true
 	})
@@ -222,7 +231,7 @@ func (b *Bot) primeCallWatcher(ctx context.Context) {
 			if evt == nil || isEmptyJSONObject(evt.Content.VeryRaw) {
 				continue
 			}
-			b.calls.handleMembership(stateKey, true)
+			b.calls.applyLegacy(evt.Sender, stateKey, true)
 		}
 	}
 	b.calls.prime()

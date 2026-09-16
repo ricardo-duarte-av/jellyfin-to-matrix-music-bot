@@ -31,8 +31,7 @@ SFU (MSC4195). The bot therefore does three separate things to become audible:
 
 ## Two MatrixRTC dialects
 
-MatrixRTC is mid-transition, and the bot speaks both dialects at once
-(`rtc.stack: both`, the default):
+MatrixRTC is mid-transition, and the bot speaks both dialects:
 
 | | membership | token |
 |---|---|---|
@@ -46,6 +45,22 @@ can only be one identity. Publishing both memberships from a single connection
 would leave half the room looking at a tile that never makes a sound, so the bot
 opens **one SFU connection per dialect** and sends every Opus frame down both.
 ffmpeg still runs once; only the upstream is duplicated.
+
+Being in the call on both is its own problem: a client that publishes both
+dialects — Element Call in Matrix 2.0 mode does — also reads both, and shows the
+bot as **two participants**. So by default (`rtc.stack: auto`) the bot is ready
+on both but in the call only on the dialects its clients need, judged per
+device:
+
+- a client publishing only the legacy membership needs the bot on legacy;
+- a client publishing only the sticky one needs it on sticky;
+- a client publishing both makes do with whichever the others need, or sticky
+  when nobody needs anything else.
+
+The bot switches as clients come and go, joining the new dialect before
+leaving the old so nobody loses it in between, and waits a couple of seconds
+after a membership change before acting so a client's two memberships are seen
+together. `rtc.stack: both` keeps the bot on both dialects regardless.
 
 The new dialect is used only when the homeserver advertises both
 `org.matrix.msc4143` and `org.matrix.msc4354` in `unstable_features`, and only
@@ -383,5 +398,6 @@ homeserver or a LiveKit server.
 
 - No media E2EE, hence the unencrypted-room requirement above.
 - One room per bot process.
-- In `both` mode the bot holds two SFU connections, so its upstream bandwidth is
-  doubled. See below.
+- In `both` mode, or in `auto` mode with a legacy-only client and a sticky-only
+  client in the same call, the bot holds two SFU connections, so its upstream
+  bandwidth is doubled. See below.

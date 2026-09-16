@@ -170,6 +170,9 @@ func (m *Membership) ActiveTransport(ctx context.Context) (*Transport, error) {
 	return nil, nil
 }
 
+// Dialect names the session-style membership.
+func (m *Membership) Dialect() string { return DialectLegacy }
+
 // Join publishes the bot's membership and starts the delayed-leave keepalive.
 // transport is the focus the bot proposes (or echoes back, if it joined an
 // existing call).

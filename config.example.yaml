@@ -29,11 +29,17 @@ rtc:
   #   both    publish both, so clients on either side of the transition see the
   #           bot. This costs a second SFU connection — the two dialects derive
   #           different LiveKit identities and one connection can only be one of
-  #           them — and so doubles the bot's upstream bandwidth.
+  #           them — and so doubles the bot's upstream bandwidth. A client that
+  #           reads both dialects (Element Call in Matrix 2.0 mode) shows the
+  #           bot twice.
+  #   auto    be ready on both, but in the call only on the dialects its
+  #           clients need: sticky for clients that publish both or only
+  #           sticky, legacy for clients that publish only legacy. The bot
+  #           switches as clients come and go, so each sees it once.
   #
-  # "sticky" and "both" fall back to legacy on a homeserver that does not
-  # advertise MSC4143 and MSC4354.
-  stack: "both"
+  # "sticky", "both" and "auto" fall back to legacy on a homeserver that does
+  # not advertise MSC4143 and MSC4354.
+  stack: "auto"
 
   # How long a published sticky membership stays valid without a refresh. The
   # bot refreshes well ahead of this; the value only bounds how long a crashed
