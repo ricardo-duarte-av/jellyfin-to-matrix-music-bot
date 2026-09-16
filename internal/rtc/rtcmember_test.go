@@ -3,6 +3,7 @@ package rtc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,10 @@ func TestJoinContentShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
+	// matrix-js-sdk refuses a join missing any of these.
+	if v, ok := decoded["versions"].([]any); !ok || v == nil {
+		t.Errorf("content has no versions array: %s", raw)
+	}
 	if _, ok := decoded["msc4354_sticky_key"]; !ok {
 		t.Errorf("content is missing the unstable sticky key field: %s", raw)
 	}
@@ -85,20 +90,33 @@ func TestJoinContentShape(t *testing.T) {
 
 func TestLeaveContentShape(t *testing.T) {
 	m := newTestStickyMembership(t)
-	content := m.leaveContent(leaveReasonNormal)
+	content := m.leaveContent()
 
-	if content.Member.Membership != "leave" {
-		t.Errorf("membership = %q; want leave", content.Member.Membership)
+	// Element Call rejects a leave that carries anything but the sticky key.
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if content.StickyKey != m.MemberID() {
-		t.Errorf("sticky key %q != member id %q", content.StickyKey, m.MemberID())
+	want := fmt.Sprintf(`{"msc4354_sticky_key":%q}`, m.MemberID())
+	if string(raw) != want {
+		t.Errorf("leave content = %s; want %s", raw, want)
 	}
-	if content.LeaveReason == nil || content.LeaveReason.Code != leaveReasonNormal {
-		t.Errorf("leave_reason = %+v; want code %q", content.LeaveReason, leaveReasonNormal)
+	if content.IsJoined() {
+		t.Error("IsJoined() = true for the bot's own leave")
 	}
-	// A leave carries no transports: there is nothing left to connect to.
-	if content.Transports != nil {
-		t.Errorf("leave advertised transports: %+v", content.Transports)
+}
+
+// matrix-js-sdk rejects a join whose member does not name the sender and its
+// device, so the membership must pick both up from the client.
+func TestJoinContentNamesSenderAndDevice(t *testing.T) {
+	client := &mautrix.Client{UserID: "@bot:example.org", DeviceID: "BOTDEVICE"}
+	m, err := NewStickyMembership(client, "!room:example.org", DefaultSlotID, DefaultStickyDuration)
+	if err != nil {
+		t.Fatalf("NewStickyMembership() = %v", err)
+	}
+	member := m.joinContent().Member
+	if member.UserID != client.UserID || member.DeviceID != client.DeviceID {
+		t.Errorf("member = %+v; want user %s device %s", member, client.UserID, client.DeviceID)
 	}
 }
 
@@ -164,6 +182,22 @@ func TestParseStickyMember(t *testing.T) {
 	}
 	if content.StickyKey != m.MemberID() {
 		t.Errorf("sticky key = %q; want %q", content.StickyKey, m.MemberID())
+	}
+
+	// Element Call omits member.membership: a join is recognised by its slot
+	// and member, a leave by content emptied down to the sticky key.
+	ecJoin := stickyEvent(t, map[string]any{
+		"slot_id":            "m.call#ROOM",
+		"member":             map[string]any{"user_id": "@a:example.org", "device_id": "DEV", "id": "k"},
+		"application":        map[string]any{"type": "m.call"},
+		"msc4354_sticky_key": "k",
+	}, time.Minute, 1000, "$c")
+	if content, err := ParseStickyMember(ecJoin); err != nil || !content.IsJoined() {
+		t.Errorf("Element Call join: IsJoined() = false, err = %v", err)
+	}
+	ecLeave := stickyEvent(t, map[string]any{"msc4354_sticky_key": "k"}, time.Minute, 2000, "$d")
+	if content, err := ParseStickyMember(ecLeave); err != nil || content.IsJoined() {
+		t.Errorf("Element Call leave: IsJoined() = true, err = %v", err)
 	}
 
 	// A membership without a sticky key cannot be placed in the ephemeral map,

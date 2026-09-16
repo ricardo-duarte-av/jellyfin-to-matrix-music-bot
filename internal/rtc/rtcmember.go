@@ -37,14 +37,9 @@ const (
 	// going below five minutes.
 	DefaultStickyDuration = 10 * time.Minute
 
-	// membershipJoin and membershipLeave are the two member.membership values.
-	membershipJoin  = "join"
-	membershipLeave = "leave"
-
-	// leaveReasonNormal is a member hanging up rather than timing out.
-	leaveReasonNormal = "leave"
-	// leaveReasonDelayed is the homeserver publishing our leave for us.
-	leaveReasonDelayed = "delayed_leave"
+	// membershipJoin is the member.membership value some clients send on a
+	// join. Element Call sends none; see IsJoined.
+	membershipJoin = "join"
 )
 
 // StickyMemberInfo identifies one membership of one user.
@@ -52,8 +47,12 @@ type StickyMemberInfo struct {
 	// ID distinguishes several memberships of the same user and device, and
 	// must be fresh for every join.
 	ID string `json:"id"`
+	// UserID and DeviceID say whose membership this is. matrix-js-sdk rejects a
+	// join without them, and requires UserID to match the sender.
+	UserID   id.UserID   `json:"user_id,omitempty"`
+	DeviceID id.DeviceID `json:"device_id,omitempty"`
 	// Membership is "join" or "leave".
-	Membership string `json:"membership"`
+	Membership string `json:"membership,omitempty"`
 }
 
 // StickyTransports describes how to exchange media with a member.
@@ -64,19 +63,15 @@ type StickyTransports struct {
 	CanSubscribe []string       `json:"can_subscribe"`
 }
 
-// StickyLeaveReason explains why a member left.
-type StickyLeaveReason struct {
-	Code   string `json:"code"`
-	Reason string `json:"reason,omitempty"`
-}
-
 // StickyMemberContent is the content of an m.rtc.member event.
 type StickyMemberContent struct {
-	SlotID      string             `json:"slot_id"`
-	Member      StickyMemberInfo   `json:"member"`
-	Application *SlotApplication   `json:"application,omitempty"`
-	Transports  *StickyTransports  `json:"transports,omitempty"`
-	LeaveReason *StickyLeaveReason `json:"leave_reason,omitempty"`
+	SlotID      string            `json:"slot_id,omitempty"`
+	Member      StickyMemberInfo  `json:"member,omitzero"`
+	Application *SlotApplication  `json:"application,omitempty"`
+	Transports  *StickyTransports `json:"transports,omitempty"`
+	// Versions is required on a join by matrix-js-sdk, even when empty, so a
+	// join sets it to a non-nil slice and omitzero only drops it from a leave.
+	Versions []string `json:"versions,omitzero"`
 	// StickyKey must equal Member.ID.
 	StickyKey string `json:"msc4354_sticky_key"`
 }
@@ -91,6 +86,8 @@ type StickyMembership struct {
 	roomID   id.RoomID
 	slotID   string
 	memberID string
+	userID   id.UserID
+	deviceID id.DeviceID
 	duration time.Duration
 
 	mu      sync.Mutex
@@ -122,13 +119,17 @@ func NewStickyMembership(client *mautrix.Client, roomID id.RoomID, slotID string
 	if duration > event.MaxStickyDuration {
 		duration = event.MaxStickyDuration
 	}
-	return &StickyMembership{
+	m := &StickyMembership{
 		client:   client,
 		roomID:   roomID,
 		slotID:   slotID,
 		memberID: memberID,
 		duration: duration,
-	}, nil
+	}
+	if client != nil {
+		m.userID, m.deviceID = client.UserID, client.DeviceID
+	}
+	return m, nil
 }
 
 // MemberID is the member.id this membership publishes under. The LiveKit
@@ -222,7 +223,7 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 		}
 		m.client.Log.Warn().Err(err).Msg("could not trigger sticky delayed leave; sending leave directly")
 	}
-	if err := m.sendLocked(ctx, m.leaveContent(leaveReasonNormal)); err != nil {
+	if err := m.sendLocked(ctx, m.leaveContent()); err != nil {
 		return fmt.Errorf("retract sticky call membership: %w", err)
 	}
 	return nil
@@ -253,25 +254,31 @@ func (m *StickyMembership) recover(ctx context.Context) (id.DelayID, error) {
 // joinContent is the membership the bot publishes while it is in the call.
 func (m *StickyMembership) joinContent() *StickyMemberContent {
 	return &StickyMemberContent{
-		SlotID:      m.slotID,
-		Member:      StickyMemberInfo{ID: m.memberID, Membership: membershipJoin},
+		SlotID: m.slotID,
+		Member: StickyMemberInfo{
+			ID:         m.memberID,
+			UserID:     m.userID,
+			DeviceID:   m.deviceID,
+			Membership: membershipJoin,
+		},
 		Application: &SlotApplication{Type: applicationCall},
 		Transports: &StickyTransports{
 			Published:    []RTCTransport{{Type: TransportTypeLiveKit}},
 			CanSubscribe: []string{TransportTypeLiveKit},
 		},
+		Versions:  []string{},
 		StickyKey: m.memberID,
 	}
 }
 
 // leaveContent is the membership that takes the bot out of the call.
-func (m *StickyMembership) leaveContent(code string) *StickyMemberContent {
-	return &StickyMemberContent{
-		SlotID:      m.slotID,
-		Member:      StickyMemberInfo{ID: m.memberID, Membership: membershipLeave},
-		LeaveReason: &StickyLeaveReason{Code: code},
-		StickyKey:   m.memberID,
-	}
+//
+// It is the join emptied down to the sticky key, the way matrix-js-sdk leaves:
+// Element Call validates anything carrying a member as a join, so a leave with
+// member or leave_reason fields is rejected as malformed and the bot lingers in
+// the call until its stickiness runs out.
+func (m *StickyMembership) leaveContent() *StickyMemberContent {
+	return &StickyMemberContent{StickyKey: m.memberID}
 }
 
 // refresh re-publishes the membership before its stickiness runs out.
@@ -319,7 +326,7 @@ func (m *StickyMembership) sendLocked(ctx context.Context, content *StickyMember
 // stop refreshing it. Caller must hold m.mu.
 func (m *StickyMembership) armDelayedLeaveLocked(ctx context.Context) error {
 	resp, err := m.client.SendMessageEvent(ctx, m.roomID, StickyMemberEventType,
-		m.leaveContent(leaveReasonDelayed), mautrix.ReqSendEvent{
+		m.leaveContent(), mautrix.ReqSendEvent{
 			UnstableDelay:          delayedLeaveTimeout,
 			UnstableStickyDuration: m.duration,
 		})
@@ -370,8 +377,18 @@ func ParseStickyMember(evt *event.Event) (*StickyMemberContent, error) {
 }
 
 // IsJoined reports whether this membership puts its member in the call.
+//
+// Element Call (matrix-js-sdk) never sets member.membership: a join is content
+// carrying a slot and a member, and a leave is content emptied down to the
+// sticky key. An explicit membership value still wins when one is present.
 func (c *StickyMemberContent) IsJoined() bool {
-	return c != nil && c.Member.Membership == membershipJoin
+	if c == nil {
+		return false
+	}
+	if c.Member.Membership != "" {
+		return c.Member.Membership == membershipJoin
+	}
+	return c.SlotID != "" && c.Member.ID != ""
 }
 
 // StickyExpiry is when a sticky event stops being sticky, as seen from here.
