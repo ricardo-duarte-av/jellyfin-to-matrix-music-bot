@@ -3,6 +3,7 @@ package rtc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,20 +90,19 @@ func TestJoinContentShape(t *testing.T) {
 
 func TestLeaveContentShape(t *testing.T) {
 	m := newTestStickyMembership(t)
-	content := m.leaveContent(leaveReasonNormal)
+	content := m.leaveContent()
 
-	if content.Member.Membership != "leave" {
-		t.Errorf("membership = %q; want leave", content.Member.Membership)
+	// Element Call rejects a leave that carries anything but the sticky key.
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if content.StickyKey != m.MemberID() {
-		t.Errorf("sticky key %q != member id %q", content.StickyKey, m.MemberID())
+	want := fmt.Sprintf(`{"msc4354_sticky_key":%q}`, m.MemberID())
+	if string(raw) != want {
+		t.Errorf("leave content = %s; want %s", raw, want)
 	}
-	if content.LeaveReason == nil || content.LeaveReason.Code != leaveReasonNormal {
-		t.Errorf("leave_reason = %+v; want code %q", content.LeaveReason, leaveReasonNormal)
-	}
-	// A leave carries no transports: there is nothing left to connect to.
-	if content.Transports != nil {
-		t.Errorf("leave advertised transports: %+v", content.Transports)
+	if content.IsJoined() {
+		t.Error("IsJoined() = true for the bot's own leave")
 	}
 }
 

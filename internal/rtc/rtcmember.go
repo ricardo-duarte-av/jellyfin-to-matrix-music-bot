@@ -37,14 +37,9 @@ const (
 	// going below five minutes.
 	DefaultStickyDuration = 10 * time.Minute
 
-	// membershipJoin and membershipLeave are the two member.membership values.
-	membershipJoin  = "join"
-	membershipLeave = "leave"
-
-	// leaveReasonNormal is a member hanging up rather than timing out.
-	leaveReasonNormal = "leave"
-	// leaveReasonDelayed is the homeserver publishing our leave for us.
-	leaveReasonDelayed = "delayed_leave"
+	// membershipJoin is the member.membership value some clients send on a
+	// join. Element Call sends none; see IsJoined.
+	membershipJoin = "join"
 )
 
 // StickyMemberInfo identifies one membership of one user.
@@ -57,7 +52,7 @@ type StickyMemberInfo struct {
 	UserID   id.UserID   `json:"user_id,omitempty"`
 	DeviceID id.DeviceID `json:"device_id,omitempty"`
 	// Membership is "join" or "leave".
-	Membership string `json:"membership"`
+	Membership string `json:"membership,omitempty"`
 }
 
 // StickyTransports describes how to exchange media with a member.
@@ -68,19 +63,12 @@ type StickyTransports struct {
 	CanSubscribe []string       `json:"can_subscribe"`
 }
 
-// StickyLeaveReason explains why a member left.
-type StickyLeaveReason struct {
-	Code   string `json:"code"`
-	Reason string `json:"reason,omitempty"`
-}
-
 // StickyMemberContent is the content of an m.rtc.member event.
 type StickyMemberContent struct {
-	SlotID      string             `json:"slot_id"`
-	Member      StickyMemberInfo   `json:"member"`
-	Application *SlotApplication   `json:"application,omitempty"`
-	Transports  *StickyTransports  `json:"transports,omitempty"`
-	LeaveReason *StickyLeaveReason `json:"leave_reason,omitempty"`
+	SlotID      string            `json:"slot_id,omitempty"`
+	Member      StickyMemberInfo  `json:"member,omitzero"`
+	Application *SlotApplication  `json:"application,omitempty"`
+	Transports  *StickyTransports `json:"transports,omitempty"`
 	// Versions is required on a join by matrix-js-sdk, even when empty, so a
 	// join sets it to a non-nil slice and omitzero only drops it from a leave.
 	Versions []string `json:"versions,omitzero"`
@@ -235,7 +223,7 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 		}
 		m.client.Log.Warn().Err(err).Msg("could not trigger sticky delayed leave; sending leave directly")
 	}
-	if err := m.sendLocked(ctx, m.leaveContent(leaveReasonNormal)); err != nil {
+	if err := m.sendLocked(ctx, m.leaveContent()); err != nil {
 		return fmt.Errorf("retract sticky call membership: %w", err)
 	}
 	return nil
@@ -284,13 +272,13 @@ func (m *StickyMembership) joinContent() *StickyMemberContent {
 }
 
 // leaveContent is the membership that takes the bot out of the call.
-func (m *StickyMembership) leaveContent(code string) *StickyMemberContent {
-	return &StickyMemberContent{
-		SlotID:      m.slotID,
-		Member:      StickyMemberInfo{ID: m.memberID, Membership: membershipLeave},
-		LeaveReason: &StickyLeaveReason{Code: code},
-		StickyKey:   m.memberID,
-	}
+//
+// It is the join emptied down to the sticky key, the way matrix-js-sdk leaves:
+// Element Call validates anything carrying a member as a join, so a leave with
+// member or leave_reason fields is rejected as malformed and the bot lingers in
+// the call until its stickiness runs out.
+func (m *StickyMembership) leaveContent() *StickyMemberContent {
+	return &StickyMemberContent{StickyKey: m.memberID}
 }
 
 // refresh re-publishes the membership before its stickiness runs out.
@@ -338,7 +326,7 @@ func (m *StickyMembership) sendLocked(ctx context.Context, content *StickyMember
 // stop refreshing it. Caller must hold m.mu.
 func (m *StickyMembership) armDelayedLeaveLocked(ctx context.Context) error {
 	resp, err := m.client.SendMessageEvent(ctx, m.roomID, StickyMemberEventType,
-		m.leaveContent(leaveReasonDelayed), mautrix.ReqSendEvent{
+		m.leaveContent(), mautrix.ReqSendEvent{
 			UnstableDelay:          delayedLeaveTimeout,
 			UnstableStickyDuration: m.duration,
 		})
