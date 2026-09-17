@@ -15,10 +15,19 @@ type fakeMember struct {
 	leaves    int
 	transport Transport
 	joinErr   error
+	// dialect pairs the membership with a leg; empty means "leg".
+	dialect string
 	// connected is what the fan-out looked like at the moment this membership
 	// was published, which is how the ordering is checked.
 	connected string
 	publisher *MultiPublisher
+}
+
+func (f *fakeMember) Dialect() string {
+	if f.dialect == "" {
+		return "leg"
+	}
+	return f.dialect
 }
 
 func (f *fakeMember) Join(_ context.Context, transport Transport) error {
@@ -176,5 +185,141 @@ func TestEnterAndLeaveAreIdempotent(t *testing.T) {
 	}
 	if member.leaves != 1 {
 		t.Errorf("retracted %d memberships; want 1", member.leaves)
+	}
+}
+
+// twoDialectSession is a session over a legacy and a sticky leg, neither
+// connected yet, choosing its dialects from whatever *want holds.
+func twoDialectSession(t *testing.T, want *[]string) (s *Session, legacy, sticky *fakeMember, conns map[string][]*fakeLeg) {
+	t.Helper()
+	log := zerolog.New(io.Discard)
+	conns = map[string][]*fakeLeg{}
+	dialFor := func(name string) dialer {
+		return func(context.Context) (publisherLeg, error) {
+			conn := &fakeLeg{identity: name}
+			conns[name] = append(conns[name], conn)
+			return conn, nil
+		}
+	}
+	m := &MultiPublisher{log: log, done: make(chan struct{}), halt: make(chan struct{}), suspended: true}
+	m.legs = []*leg{
+		{name: DialectLegacy, dead: true, dial: dialFor(DialectLegacy)},
+		{name: DialectSticky, dead: true, dial: dialFor(DialectSticky)},
+	}
+	legacy = &fakeMember{dialect: DialectLegacy}
+	sticky = &fakeMember{dialect: DialectSticky}
+	s = NewSession(log, NewFocus("https://focus.example.org"), m, nil, legacy, sticky)
+	s.ChooseDialects(func() []string { return *want })
+	return s, legacy, sticky, conns
+}
+
+// A client reading both dialects shows a bot on both as two participants, so
+// the session joins only on the dialects it is told the call needs — and does
+// not even connect the other.
+func TestEnterJoinsOnlyTheChosenDialects(t *testing.T) {
+	want := []string{DialectSticky}
+	s, legacy, sticky, conns := twoDialectSession(t, &want)
+
+	if err := s.Enter(context.Background()); err != nil {
+		t.Fatalf("Enter() = %v", err)
+	}
+	if legacy.joins != 0 || sticky.joins != 1 {
+		t.Errorf("joins legacy=%d sticky=%d; want 0 and 1", legacy.joins, sticky.joins)
+	}
+	if len(conns[DialectLegacy]) != 0 {
+		t.Error("connected the legacy leg for a dialect nobody needs")
+	}
+	if len(conns[DialectSticky]) != 1 {
+		t.Errorf("dialled the sticky leg %d times; want 1", len(conns[DialectSticky]))
+	}
+}
+
+// With nobody to go by the bot cannot know what the call reads, and being seen
+// twice beats not being seen.
+func TestEnterJoinsEveryDialectWhenNoneIsChosen(t *testing.T) {
+	var want []string
+	s, legacy, sticky, _ := twoDialectSession(t, &want)
+
+	if err := s.Enter(context.Background()); err != nil {
+		t.Fatalf("Enter() = %v", err)
+	}
+	if legacy.joins != 1 || sticky.joins != 1 {
+		t.Errorf("joins legacy=%d sticky=%d; want both", legacy.joins, sticky.joins)
+	}
+}
+
+// Moving between dialects joins the new one before leaving the old, so no
+// client loses the bot in between, and drops the old connection.
+func TestReconcileSwitchesDialects(t *testing.T) {
+	want := []string{DialectLegacy}
+	s, legacy, sticky, conns := twoDialectSession(t, &want)
+	ctx := context.Background()
+	if err := s.Enter(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	want = []string{DialectSticky}
+	if err := s.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile() = %v", err)
+	}
+	if sticky.joins != 1 || legacy.leaves != 1 {
+		t.Errorf("sticky joins=%d legacy leaves=%d; want 1 and 1", sticky.joins, legacy.leaves)
+	}
+	if _, _, _, closed := conns[DialectLegacy][0].counts(); !closed {
+		t.Error("kept the legacy connection after leaving that dialect")
+	}
+	if len(conns[DialectSticky]) != 1 {
+		t.Fatalf("dialled the sticky leg %d times; want 1", len(conns[DialectSticky]))
+	}
+	if _, _, _, closed := conns[DialectSticky][0].counts(); closed {
+		t.Error("closed the connection of the dialect it switched to")
+	}
+
+	// Nothing changed, so nothing happens.
+	if err := s.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sticky.joins != 1 || legacy.joins != 1 {
+		t.Errorf("a no-op Reconcile rejoined: legacy=%d sticky=%d", legacy.joins, sticky.joins)
+	}
+
+	// Leaving the call retracts only the dialect the bot is on.
+	if err := s.Leave(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.leaves != 1 || sticky.leaves != 1 {
+		t.Errorf("leaves legacy=%d sticky=%d; want 1 each", legacy.leaves, sticky.leaves)
+	}
+}
+
+// A dialect that will not take the bot keeps it where it was: dropping the old
+// one first would leave its clients with nobody.
+func TestReconcileKeepsTheOldDialectWhenTheNewOneFails(t *testing.T) {
+	want := []string{DialectLegacy}
+	s, legacy, sticky, _ := twoDialectSession(t, &want)
+	ctx := context.Background()
+	if err := s.Enter(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sticky.joinErr = errors.New("slot closed")
+	want = []string{DialectSticky}
+	if err := s.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile() = nil with the new dialect refusing the bot")
+	}
+	if legacy.leaves != 0 {
+		t.Error("left the legacy dialect without getting onto the sticky one")
+	}
+}
+
+// Reconcile is for a bot already in the call; it must not drag one in.
+func TestReconcileOutsideTheCallDoesNothing(t *testing.T) {
+	want := []string{DialectSticky}
+	s, legacy, sticky, conns := twoDialectSession(t, &want)
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.joins+sticky.joins != 0 || len(conns) != 0 || s.Joined() {
+		t.Error("Reconcile() joined a call the bot was not in")
 	}
 }

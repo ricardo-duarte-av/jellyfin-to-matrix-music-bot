@@ -198,7 +198,7 @@ func run(configPath string) error {
 		// the call, so it costs nothing then.
 		go membership.Watch(ctx)
 
-		legs = append(legs, rtc.NamedPublisher{Name: "legacy", Dial: dial})
+		legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectLegacy, Dial: dial})
 		members = append(members, membership)
 		alias = sfu.Alias
 	}
@@ -244,7 +244,7 @@ func run(configPath string) error {
 				Str("url", sfu.URL).Str("alias", sfu.Alias).Str("identity", sfu.Identity).
 				Str("source", string(sfu.Source)).Msg("got livekit credentials for sticky membership")
 
-			legs = append(legs, rtc.NamedPublisher{Name: "sticky", Dial: dial})
+			legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectSticky, Dial: dial})
 			members = append(members, rtc.StickyMember(sticky))
 		}
 	}
@@ -342,6 +342,11 @@ func run(configPath string) error {
 
 	bot = matrix.New(cfg, client, jf, plr)
 	bot.SetCall(call)
+	if cfg.RTC.PicksDialects() {
+		// A client reading both dialects shows a bot on both as two
+		// participants, so be on only the ones the call's clients need.
+		call.ChooseDialects(bot.WantedDialects)
+	}
 	if artPublisher != nil {
 		bot.SetArtPublisher(artPublisher)
 	}

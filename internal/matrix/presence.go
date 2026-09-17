@@ -37,6 +37,10 @@ type callWatcher struct {
 	mu sync.Mutex
 	// present holds the membership state keys currently in the call.
 	present map[string]bool
+	// legacyDevice records whose device each of those state keys is, for the
+	// ones that arrived with a sender. It is what lines a legacy membership up
+	// with a sticky one from the same client.
+	legacyDevice map[string]callDevice
 	// sticky holds MSC4143 memberships, keyed by sender and sticky key. These
 	// are message events rather than state, so they are tracked separately and
 	// expire on a timer instead of being retracted.
@@ -66,12 +70,22 @@ type stickyEntry struct {
 	// last to expire wins.
 	score   int64
 	eventID string
+	// device is the member.device_id the membership was published for, empty
+	// when the client did not say.
+	device id.DeviceID
+}
+
+// callDevice is one client in the call, whichever dialects it publishes.
+type callDevice struct {
+	user   id.UserID
+	device string
 }
 
 func newCallWatcher() *callWatcher {
 	return &callWatcher{
-		present: make(map[string]bool),
-		sticky:  make(map[stickyHandle]*stickyEntry),
+		present:      make(map[string]bool),
+		legacyDevice: make(map[string]callDevice),
+		sticky:       make(map[stickyHandle]*stickyEntry),
 	}
 }
 
@@ -86,6 +100,7 @@ func (w *callWatcher) handleMembership(stateKey string, joined bool) callChange 
 		w.present[stateKey] = true
 	} else {
 		delete(w.present, stateKey)
+		delete(w.legacyDevice, stateKey)
 	}
 	if !w.primed || joined == was {
 		return callNoChange
@@ -106,8 +121,10 @@ func (w *callWatcher) applyLegacy(userID id.UserID, stateKey string, joined bool
 	before := w.handlesLocked(userID, now)
 	if joined {
 		w.present[stateKey] = true
+		w.legacyDevice[stateKey] = callDevice{user: userID, device: legacyDeviceID(stateKey, userID)}
 	} else {
 		delete(w.present, stateKey)
+		delete(w.legacyDevice, stateKey)
 	}
 	after := w.handlesLocked(userID, now)
 
@@ -169,6 +186,82 @@ func (w *callWatcher) anyoneElse(self id.UserID, now time.Time) bool {
 	return false
 }
 
+// Dialects the bot can be in a call on, as the rest of the call reads them.
+type dialectNeeds struct {
+	legacy, sticky bool
+}
+
+// dialects reports which dialects the bot has to be in the call on for every
+// other client in it to see it exactly once.
+//
+// A client that publishes only one dialect can only be relied on to read that
+// one, so it needs the bot there. A client that publishes both — Element Call in
+// Matrix 2.0 mode does — reads both, and would show a bot on both as two
+// participants; it is served by whichever the others need, and by sticky alone
+// when nobody needs anything. An empty call needs nothing.
+func (w *callWatcher) dialects(self id.UserID, now time.Time) dialectNeeds {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	type seen struct{ legacy, sticky bool }
+	devices := make(map[callDevice]*seen)
+	mark := func(d callDevice) *seen {
+		if devices[d] == nil {
+			devices[d] = &seen{}
+		}
+		return devices[d]
+	}
+	for stateKey := range w.present {
+		d, ok := w.legacyDevice[stateKey]
+		if !ok {
+			// Recorded without a sender, so it cannot be matched to anything:
+			// a client of its own.
+			d = callDevice{device: "legacy:" + stateKey}
+		}
+		if d.user == self || rtc.MembershipBelongsTo(stateKey, self) {
+			continue
+		}
+		mark(d).legacy = true
+	}
+	for handle, entry := range w.sticky {
+		if handle.sender == self || !entry.joined || !entry.expiresAt.After(now) {
+			continue
+		}
+		d := callDevice{user: handle.sender, device: string(entry.device)}
+		if entry.device == "" {
+			d.device = "sticky:" + handle.stickyKey
+		}
+		mark(d).sticky = true
+	}
+
+	var needs dialectNeeds
+	for _, s := range devices {
+		needs.legacy = needs.legacy || (s.legacy && !s.sticky)
+		needs.sticky = needs.sticky || (s.sticky && !s.legacy)
+	}
+	if len(devices) > 0 && !needs.legacy && !needs.sticky {
+		needs.sticky = true
+	}
+	return needs
+}
+
+// legacyDeviceID pulls the device out of a session-style state key, which is
+// "_<user>_<device>_<application>" or the older "<user>_<device>". The user is
+// known, so underscores in its localpart do not get in the way. A key naming no
+// device is returned whole, so it still stands for one client.
+func legacyDeviceID(stateKey string, user id.UserID) string {
+	owner := user.String()
+	rest, ok := strings.CutPrefix(stateKey, "_"+owner+"_")
+	if !ok {
+		rest, ok = strings.CutPrefix(stateKey, owner+"_")
+	}
+	if !ok || rest == "" {
+		return stateKey
+	}
+	device, _, _ := strings.Cut(rest, "_")
+	return device
+}
+
 // applySticky records a sticky membership event and reports what it means for
 // the sender's presence overall.
 func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.Time, stickyKey string, now time.Time) callChange {
@@ -183,8 +276,12 @@ func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.
 		return callNoChange
 	}
 
+	var device id.DeviceID
+	if content, err := rtc.ParseStickyMember(evt); err == nil {
+		device = content.Member.DeviceID
+	}
 	before := w.handlesLocked(evt.Sender, now)
-	w.sticky[handle] = &stickyEntry{joined: joined, expiresAt: expiresAt, score: score, eventID: eventID}
+	w.sticky[handle] = &stickyEntry{joined: joined, expiresAt: expiresAt, score: score, eventID: eventID, device: device}
 	after := w.handlesLocked(evt.Sender, now)
 
 	if !w.stickyPrimed {
@@ -324,11 +421,9 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 	case callJoined:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("joined the call")
 		b.announcePresence(ctx, evt.Sender, "joined")
-		b.followAudience(ctx)
 	case callLeft:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("left the call")
 		b.announcePresence(ctx, evt.Sender, "left")
-		b.followAudience(ctx)
 	case callNoChange:
 		// Someone in the call from two devices who closes one has not left, and
 		// neither has someone whose other dialect still says they are there.
@@ -338,6 +433,9 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 				Msg("left the call on one membership, still present on another")
 		}
 	}
+	// Even a change that moves nobody in or out can move a client between
+	// dialects, and with it the dialects the bot should be on.
+	b.audienceChanged()
 }
 
 // handleStickyMember is the sync handler for MSC4143 membership events.
@@ -378,12 +476,11 @@ func (b *Bot) handleStickyMember(ctx context.Context, evt *event.Event) {
 	case callJoined:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("joined the call")
 		b.announcePresence(ctx, evt.Sender, "joined")
-		b.followAudience(ctx)
 	case callLeft:
 		b.client.Log.Info().Str("user_id", evt.Sender.String()).Msg("left the call")
 		b.announcePresence(ctx, evt.Sender, "left")
-		b.followAudience(ctx)
 	}
+	b.audienceChanged()
 }
 
 // sweepStickyMemberships announces the members whose stickiness has lapsed.
@@ -395,6 +492,65 @@ func (b *Bot) sweepStickyMemberships(ctx context.Context) {
 	}
 	if len(left) > 0 {
 		b.followAudience(ctx)
+		b.followDialects(ctx)
+	}
+}
+
+// WantedDialects names the MatrixRTC dialects the bot should be in the call on
+// so that every other client sees it once. It names none for an empty call.
+func (b *Bot) WantedDialects() []string {
+	needs := b.calls.dialects(b.client.UserID, time.Now())
+	var dialects []string
+	if needs.legacy {
+		dialects = append(dialects, rtc.DialectLegacy)
+	}
+	if needs.sticky {
+		dialects = append(dialects, rtc.DialectSticky)
+	}
+	return dialects
+}
+
+// audienceSettle is how long membership changes are left to settle before the
+// bot acts on them.
+//
+// A Matrix 2.0 client publishes a legacy and a sticky membership as two
+// requests, which can reach the bot in different syncs. Acting on the first
+// would put the bot in the call on legacy alone, only to switch it to sticky a
+// moment later — a visible leave and rejoin for everybody. Entering takes
+// seconds of token exchanges anyway, so a short wait costs little.
+const audienceSettle = 2 * time.Second
+
+// audienceChanged schedules the audience and dialect decisions for once the
+// memberships stop changing. It runs them on a timer rather than in the sync
+// handler, since the event that settles the question can only arrive once the
+// handler has returned.
+func (b *Bot) audienceChanged() {
+	b.settleMu.Lock()
+	defer b.settleMu.Unlock()
+	if b.settleTimer != nil {
+		// A decision already running is harmless: both are idempotent, and
+		// the one scheduled here reads the newer state.
+		b.settleTimer.Stop()
+	}
+	b.settleTimer = time.AfterFunc(audienceSettle, func() {
+		ctx := context.Background()
+		b.followAudience(ctx)
+		b.followDialects(ctx)
+	})
+}
+
+// followDialects moves the bot onto the dialects the call's clients read, after
+// a membership change that may have changed them.
+func (b *Bot) followDialects(ctx context.Context) {
+	b.audience.Lock()
+	defer b.audience.Unlock()
+	if b.call == nil || !b.call.Joined() {
+		return
+	}
+	switchCtx, cancel := context.WithTimeout(ctx, callEnterTimeout)
+	defer cancel()
+	if err := b.call.Reconcile(switchCtx); err != nil {
+		b.client.Log.Err(err).Msg("could not switch call dialects")
 	}
 }
 

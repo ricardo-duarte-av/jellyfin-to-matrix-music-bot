@@ -91,6 +91,9 @@ type leg struct {
 	pub  publisherLeg
 	dial dialer
 	dead bool
+	// disabled takes the leg out of the call on purpose: its dialect is not one
+	// anybody in the call reads, so it is neither connected nor redialled.
+	disabled bool
 	// redialing guards against two reconnect loops for one leg: the failure
 	// usually shows up twice, once as a write error and once as a disconnect.
 	redialing bool
@@ -167,7 +170,7 @@ func (m *MultiPublisher) watch(l *leg, pub publisherLeg) {
 // lost retires a leg and starts reconnecting it.
 func (m *MultiPublisher) lost(l *leg, cause error) {
 	m.mu.Lock()
-	if m.closed || m.suspended || l.dead {
+	if m.closed || m.suspended || l.dead || l.disabled {
 		// A connection dropping is expected while suspended — the bot closed
 		// it on the way out of the call — and there is nothing to heal.
 		m.mu.Unlock()
@@ -182,7 +185,7 @@ func (m *MultiPublisher) lost(l *leg, cause error) {
 // startRedialLocked launches the reconnect loop for a retired leg, unless one
 // is already running or the leg cannot be redialled. Caller must hold m.mu.
 func (m *MultiPublisher) startRedialLocked(l *leg) {
-	if m.closed || m.suspended || l.dial == nil || l.redialing {
+	if m.closed || m.suspended || l.disabled || l.dial == nil || l.redialing {
 		return
 	}
 	l.redialing = true
@@ -208,6 +211,12 @@ func (m *MultiPublisher) redial(l *leg, epoch int) {
 			// The bot left the call; this leg is no longer wanted.
 			return
 		case <-time.After(m.waitFor(attempt)):
+		}
+		m.mu.Lock()
+		disabled := l.disabled
+		m.mu.Unlock()
+		if disabled {
+			return
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), redialTimeout)
@@ -253,7 +262,7 @@ func redialWait(attempt int) time.Duration {
 // track it missed. It reports false if the publisher closed meanwhile.
 func (m *MultiPublisher) adopt(l *leg, pub publisherLeg, epoch int) bool {
 	m.mu.Lock()
-	if m.closed || m.epoch != epoch {
+	if m.closed || m.epoch != epoch || l.disabled {
 		m.mu.Unlock()
 		return false
 	}
@@ -423,7 +432,10 @@ func (m *MultiPublisher) Resume(ctx context.Context) error {
 	var failed []string
 	live := 0
 	for _, l := range legs {
-		if l.dial == nil {
+		m.mu.Lock()
+		skip := l.dial == nil || l.disabled
+		m.mu.Unlock()
+		if skip {
 			continue
 		}
 		pub, err := l.dial(ctx)
@@ -452,6 +464,96 @@ func (m *MultiPublisher) Resume(ctx context.Context) error {
 		// other; the redial loop has those legs.
 		m.log.Warn().Strs("errors", failed).Int("connected", live).
 			Msg("connected on some livekit legs but not all; retrying the rest")
+	}
+	return nil
+}
+
+// SelectLegs chooses which legs the next Resume connects. Legs not named stay
+// out of the call until selected again. It only records the choice; use
+// EnableLeg and DisableLeg to change the legs of a publisher that is connected.
+func (m *MultiPublisher) SelectLegs(names map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, l := range m.legs {
+		l.disabled = !names[l.name]
+	}
+}
+
+// EnableLeg brings one leg into a connected fan-out, dialling it now.
+//
+// The error is the dial's: a caller about to publish the matching membership
+// must not, since that would advertise a participant nobody can hear. The leg
+// is left disabled in that case rather than handed to the redial loop.
+func (m *MultiPublisher) EnableLeg(ctx context.Context, name string) error {
+	m.mu.Lock()
+	l := m.legLocked(name)
+	switch {
+	case l == nil:
+		m.mu.Unlock()
+		return fmt.Errorf("no livekit leg named %q", name)
+	case m.closed:
+		m.mu.Unlock()
+		return fmt.Errorf("publisher is closed")
+	case !l.disabled:
+		m.mu.Unlock()
+		return nil
+	}
+	l.disabled = false
+	if m.suspended {
+		m.mu.Unlock()
+		return nil
+	}
+	epoch := m.epoch
+	m.mu.Unlock()
+
+	if l.dial == nil {
+		return m.refuseLeg(l, fmt.Errorf("leg %q cannot be dialled", name))
+	}
+	pub, err := l.dial(ctx)
+	if err != nil {
+		return m.refuseLeg(l, err)
+	}
+	if !m.adopt(l, pub, epoch) {
+		pub.Close()
+		return fmt.Errorf("left the call while connecting leg %q", name)
+	}
+	m.log.Info().Str("leg", name).Str("identity", pub.Identity()).Msg("connected livekit leg")
+	return nil
+}
+
+// refuseLeg puts a leg that would not connect back out of the fan-out.
+func (m *MultiPublisher) refuseLeg(l *leg, err error) error {
+	m.mu.Lock()
+	l.disabled = true
+	m.mu.Unlock()
+	return err
+}
+
+// DisableLeg takes one leg out of the fan-out and drops its connection.
+func (m *MultiPublisher) DisableLeg(name string) {
+	m.mu.Lock()
+	l := m.legLocked(name)
+	if l == nil || l.disabled {
+		m.mu.Unlock()
+		return
+	}
+	l.disabled = true
+	pub := l.pub
+	l.pub, l.dead = nil, true
+	m.mu.Unlock()
+
+	if pub != nil {
+		pub.Close()
+		m.log.Info().Str("leg", name).Msg("disconnected livekit leg")
+	}
+}
+
+// legLocked finds a leg by name. Caller must hold m.mu.
+func (m *MultiPublisher) legLocked(name string) *leg {
+	for _, l := range m.legs {
+		if l.name == name {
+			return l
+		}
 	}
 	return nil
 }

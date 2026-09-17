@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -290,6 +291,9 @@ type fakeCall struct {
 	enters   int
 	leaves   int
 	enterErr error
+	// onEnter, when set, runs as the bot enters, so a test can see what the
+	// bot would have chosen at that moment.
+	onEnter func()
 	// left is signalled on every departure, so a test can wait for the linger
 	// to run out instead of sleeping for it.
 	left chan struct{}
@@ -303,6 +307,9 @@ func (f *fakeCall) Enter(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.enters++
+	if f.onEnter != nil {
+		f.onEnter()
+	}
 	if f.enterErr != nil {
 		return f.enterErr
 	}
@@ -318,6 +325,8 @@ func (f *fakeCall) Leave(context.Context) error {
 	f.left <- struct{}{}
 	return nil
 }
+
+func (f *fakeCall) Reconcile(context.Context) error { return nil }
 
 func (f *fakeCall) Joined() bool {
 	f.mu.Lock()
@@ -539,5 +548,150 @@ func TestNothingHappensWithLeavingTurnedOff(t *testing.T) {
 
 	if enters, leaves := call.counts(); enters != 0 || leaves != 0 {
 		t.Errorf("entered %d and left %d times with leave_when_alone off; want none", enters, leaves)
+	}
+}
+
+// stickyMemberOn is a sticky join published from a named device, the way
+// Element Call publishes it.
+func stickyMemberOn(t *testing.T, sender id.UserID, device id.DeviceID, eventID string, now time.Time) *event.Event {
+	t.Helper()
+	content := rtc.StickyMemberContent{
+		SlotID:    rtc.DefaultSlotID,
+		Member:    rtc.StickyMemberInfo{ID: eventID, UserID: sender, DeviceID: device},
+		StickyKey: eventID,
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evt := &event.Event{
+		ID:        id.EventID(eventID),
+		Sender:    sender,
+		Type:      rtc.StickyMemberEventType,
+		Timestamp: now.UnixMilli(),
+		Sticky:    &event.Sticky{},
+	}
+	evt.Sticky.Duration.Duration = 10 * time.Minute
+	evt.Content.VeryRaw = raw
+	return evt
+}
+
+func TestDialectsFollowWhatEachClientPublishes(t *testing.T) {
+	const self = id.UserID("@bot:example.org")
+	const alice = id.UserID("@alice:example.org")
+	now := time.Now()
+	join := func(w *callWatcher, evt *event.Event) {
+		w.applySticky(evt, true, now.Add(10*time.Minute), string(evt.ID), now)
+	}
+
+	t.Run("empty call needs nothing", func(t *testing.T) {
+		w := primedWatcher()
+		// The bot's own memberships are not an audience.
+		w.applyLegacy(self, "_@bot:example.org_BOT_m.call", true)
+		join(w, stickyMemberOn(t, self, "BOT", "$self", now))
+		if got := w.dialects(self, now); got != (dialectNeeds{}) {
+			t.Errorf("dialects = %+v; want none", got)
+		}
+	})
+
+	t.Run("Matrix 2.0 client publishing both reads sticky alone", func(t *testing.T) {
+		w := primedWatcher()
+		w.applyLegacy(bob, "_@bob:example.org_LAPTOP_m.call", true)
+		join(w, stickyMemberOn(t, bob, "LAPTOP", "$bob", now))
+		if got := w.dialects(self, now); got != (dialectNeeds{sticky: true}) {
+			t.Errorf("dialects = %+v; want sticky only", got)
+		}
+	})
+
+	t.Run("legacy-only client needs legacy, and a dual client makes do", func(t *testing.T) {
+		w := primedWatcher()
+		w.applyLegacy(bob, "_@bob:example.org_LAPTOP_m.call", true)
+		join(w, stickyMemberOn(t, bob, "LAPTOP", "$bob", now))
+		w.applyLegacy(alice, "_@alice:example.org_PHONE_m.call", true)
+		if got := w.dialects(self, now); got != (dialectNeeds{legacy: true}) {
+			t.Errorf("dialects = %+v; want legacy only", got)
+		}
+	})
+
+	t.Run("one client per dialect needs both", func(t *testing.T) {
+		w := primedWatcher()
+		join(w, stickyMemberOn(t, bob, "LAPTOP", "$bob", now))
+		w.applyLegacy(alice, "_@alice:example.org_PHONE_m.call", true)
+		if got := w.dialects(self, now); got != (dialectNeeds{legacy: true, sticky: true}) {
+			t.Errorf("dialects = %+v; want both", got)
+		}
+	})
+
+	t.Run("the same user on two devices is two clients", func(t *testing.T) {
+		w := primedWatcher()
+		join(w, stickyMemberOn(t, bob, "LAPTOP", "$bob", now))
+		w.applyLegacy(bob, "_@bob:example.org_PHONE_m.call", true)
+		if got := w.dialects(self, now); got != (dialectNeeds{legacy: true, sticky: true}) {
+			t.Errorf("dialects = %+v; want both", got)
+		}
+	})
+
+	t.Run("a legacy leave hands the client back to sticky", func(t *testing.T) {
+		w := primedWatcher()
+		join(w, stickyMemberOn(t, bob, "LAPTOP", "$bob", now))
+		w.applyLegacy(alice, "_@alice:example.org_PHONE_m.call", true)
+		w.applyLegacy(alice, "_@alice:example.org_PHONE_m.call", false)
+		if got := w.dialects(self, now); got != (dialectNeeds{sticky: true}) {
+			t.Errorf("dialects = %+v; want sticky only", got)
+		}
+	})
+}
+
+func TestLegacyDeviceID(t *testing.T) {
+	for _, tc := range []struct {
+		stateKey string
+		user     id.UserID
+		want     string
+	}{
+		{"_@bob:example.org_LAPTOP_m.call", "@bob:example.org", "LAPTOP"},
+		{"@bob:example.org_LAPTOP", "@bob:example.org", "LAPTOP"},
+		// An underscore in the localpart is not a separator.
+		{"_@b_o_b:example.org_LAPTOP_m.call", "@b_o_b:example.org", "LAPTOP"},
+		{"@bob:example.org", "@bob:example.org", "@bob:example.org"},
+	} {
+		if got := legacyDeviceID(tc.stateKey, tc.user); got != tc.want {
+			t.Errorf("legacyDeviceID(%q) = %q; want %q", tc.stateKey, got, tc.want)
+		}
+	}
+}
+
+// A Matrix 2.0 client's two memberships can land in separate syncs. Deciding on
+// the first would put the bot in the call on legacy only and then switch it, so
+// the decision waits for the burst to settle and sees both.
+func TestAudienceDecisionWaitsForBothMembershipsOfAClient(t *testing.T) {
+	b, _, call := audienceBot(t, true)
+	call.joined = false
+	var chose []string
+	call.onEnter = func() { chose = b.WantedDialects() }
+	now := time.Now()
+
+	b.calls.applyLegacy(bob, "_@bob:example.org_LAPTOP_m.call", true)
+	b.audienceChanged()
+	if enters, _ := call.counts(); enters != 0 {
+		t.Fatal("entered the call before the memberships settled")
+	}
+	b.calls.applySticky(stickyMemberOn(t, bob, "LAPTOP", "$bob", now), true, now.Add(10*time.Minute), "$bob", now)
+	b.audienceChanged()
+
+	deadline := time.Now().Add(audienceSettle + 2*time.Second)
+	for {
+		if enters, _ := call.counts(); enters > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never entered the call")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if enters, _ := call.counts(); enters != 1 {
+		t.Errorf("entered %d times; want 1", enters)
+	}
+	if !slices.Equal(chose, []string{rtc.DialectSticky}) {
+		t.Errorf("entered choosing %v; want sticky only", chose)
 	}
 }

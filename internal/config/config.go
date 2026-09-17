@@ -84,7 +84,8 @@ type RTC struct {
 	DisplayName       string `yaml:"display_name"`
 	// Stack selects which MatrixRTC dialect the bot speaks: "legacy" for the
 	// session-style membership Element Call has always used, "sticky" for the
-	// MSC4143/MSC4354 membership replacing it, or "both".
+	// MSC4143/MSC4354 membership replacing it, "both", or "auto" (the default)
+	// to be ready on both but in the call only on those its clients need.
 	//
 	// "both" costs a second SFU connection, and so doubles the bot's upstream
 	// bandwidth: the two dialects derive different LiveKit identities, and one
@@ -119,13 +120,18 @@ const (
 	StackLegacy = "legacy"
 	StackSticky = "sticky"
 	StackBoth   = "both"
+	StackAuto   = "auto"
 )
 
 // UsesLegacy reports whether the session-style membership should be published.
-func (r RTC) UsesLegacy() bool { return r.Stack == StackLegacy || r.Stack == StackBoth }
+func (r RTC) UsesLegacy() bool { return r.Stack != StackSticky }
 
 // UsesSticky reports whether the MSC4143 membership should be published.
-func (r RTC) UsesSticky() bool { return r.Stack == StackSticky || r.Stack == StackBoth }
+func (r RTC) UsesSticky() bool { return r.Stack != StackLegacy }
+
+// PicksDialects reports whether the dialects to be in a call on are chosen from
+// the clients in it, rather than being every dialect the bot speaks.
+func (r RTC) PicksDialects() bool { return r.Stack == StackAuto }
 
 // Jellyfin holds the media server connection details.
 type Jellyfin struct {
@@ -173,7 +179,7 @@ func (c *Config) applyDefaults() {
 		c.RTC.DisplayName = "Jukebox"
 	}
 	if c.RTC.Stack == "" {
-		c.RTC.Stack = StackBoth
+		c.RTC.Stack = StackAuto
 	}
 	if c.RTC.StickyDuration <= 0 {
 		c.RTC.StickyDuration = 10 * time.Minute
@@ -246,9 +252,9 @@ func (c *Config) validate() error {
 	}
 
 	switch c.RTC.Stack {
-	case StackLegacy, StackSticky, StackBoth:
+	case StackLegacy, StackSticky, StackBoth, StackAuto:
 	default:
-		return fmt.Errorf("rtc.stack must be legacy, sticky or both, got %q", c.RTC.Stack)
+		return fmt.Errorf("rtc.stack must be legacy, sticky, both or auto, got %q", c.RTC.Stack)
 	}
 	if c.RTC.StickyDuration > time.Hour {
 		return fmt.Errorf("rtc.sticky_duration must not exceed 1h, got %s", c.RTC.StickyDuration)
