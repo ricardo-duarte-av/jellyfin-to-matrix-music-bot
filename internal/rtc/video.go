@@ -30,16 +30,21 @@ type videoTrack struct {
 	stopTimer chan struct{}
 }
 
-func newVideoTrack(room *lksdk.Room, name string) (*videoTrack, error) {
+func newVideoTrack(room *lksdk.Room, name string, keys *MediaKeys) (*videoTrack, error) {
 	v := &videoTrack{stopTimer: make(chan struct{})}
 
+	trackOpts, encryption, err := encryptionOptions(keys, lksdk.CodecH264)
+	if err != nil {
+		return nil, err
+	}
+	trackOpts = append(trackOpts, lksdk.WithRTCPHandler(v.onRTCP))
 	track, err := lksdk.NewLocalSampleTrack(webrtc.RTPCodecCapability{
 		MimeType:  webrtc.MimeTypeH264,
 		ClockRate: 90000,
 		// Constrained baseline, the profile every WebRTC stack offers. It has
 		// to match one the SFU advertises or the track is rejected outright.
 		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-	}, lksdk.WithRTCPHandler(v.onRTCP))
+	}, trackOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
@@ -49,6 +54,7 @@ func newVideoTrack(room *lksdk.Room, name string) (*videoTrack, error) {
 		Source:      livekit.TrackSource_CAMERA,
 		VideoWidth:  videoSize,
 		VideoHeight: videoSize,
+		Encryption:  encryption,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("publish video track: %w", err)

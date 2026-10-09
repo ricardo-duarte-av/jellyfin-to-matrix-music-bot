@@ -14,6 +14,7 @@ import (
 	_ "image/png"
 
 	"github.com/bbrks/go-blurhash"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -35,7 +36,10 @@ const (
 
 // uploadedImage is one uploaded picture in the homeserver's media repo.
 type uploadedImage struct {
+	// URI is the plain upload. In an encrypted room it is empty and File
+	// carries the encrypted upload and the key to it instead.
 	URI    id.ContentURIString
+	File   *event.EncryptedFileInfo
 	Mime   string
 	Size   int
 	Width  int
@@ -112,6 +116,7 @@ func (b *Bot) sendNowPlaying(ctx context.Context, item jellyfin.Item, caption st
 	info := art.Full.fileInfo()
 	if art.Thumbnail != nil {
 		info.ThumbnailURL = art.Thumbnail.URI
+		info.ThumbnailFile = art.Thumbnail.File
 		info.ThumbnailInfo = art.Thumbnail.fileInfo()
 	}
 	if art.Blurhash != "" {
@@ -125,6 +130,7 @@ func (b *Bot) sendNowPlaying(ctx context.Context, item jellyfin.Item, caption st
 		Body:     caption,
 		FileName: coverFileName(item),
 		URL:      art.Full.URI,
+		File:     art.Full.File,
 		Info:     info,
 	}
 	if _, err := b.client.SendMessageEvent(ctx, b.roomID, event.EventMessage, &content); err != nil {
@@ -135,15 +141,24 @@ func (b *Bot) sendNowPlaying(ctx context.Context, item jellyfin.Item, caption st
 
 // uploadArtwork fetches a track's cover and its thumbnail, uploads both, and
 // computes a blurhash. Repeat calls for the same cover reuse the upload.
+//
+// In an encrypted room the covers are uploaded encrypted, as any client would
+// upload a picture there. The cache keeps the two kinds apart, so a room that
+// turns encryption on does not go on posting plain uploads.
 func (b *Bot) uploadArtwork(ctx context.Context, item jellyfin.Item) (uploaded, error) {
 	if item.ArtworkID == "" {
 		return uploaded{}, jellyfin.ErrNoArtwork
 	}
-	if cached, ok := b.artwork.get(item.ArtworkID); ok {
+	encrypt := b.encrypted(ctx)
+	cacheKey := item.ArtworkID
+	if encrypt {
+		cacheKey += "#encrypted"
+	}
+	if cached, ok := b.artwork.get(cacheKey); ok {
 		return cached, nil
 	}
 
-	_, full, err := b.fetchAndUpload(ctx, item, artworkSize)
+	_, full, err := b.fetchAndUpload(ctx, item, artworkSize, encrypt)
 	if err != nil {
 		return uploaded{}, err
 	}
@@ -151,7 +166,7 @@ func (b *Bot) uploadArtwork(ctx context.Context, item jellyfin.Item) (uploaded, 
 
 	// The thumbnail and blurhash are decoration: a failure here should still
 	// leave a perfectly good image event.
-	if thumbData, thumb, err := b.fetchAndUpload(ctx, item, thumbnailSize); err != nil {
+	if thumbData, thumb, err := b.fetchAndUpload(ctx, item, thumbnailSize, encrypt); err != nil {
 		b.client.Log.Debug().Err(err).Msg("no thumbnail for cover")
 	} else {
 		art.Thumbnail = &thumb
@@ -162,23 +177,35 @@ func (b *Bot) uploadArtwork(ctx context.Context, item jellyfin.Item) (uploaded, 
 		}
 	}
 
-	b.artwork.put(item.ArtworkID, art)
+	b.artwork.put(cacheKey, art)
 	return art, nil
 }
 
 // fetchAndUpload uploads a cover at the given size and also returns the raw
 // bytes, so the caller can derive a blurhash without fetching twice.
-func (b *Bot) fetchAndUpload(ctx context.Context, item jellyfin.Item, size int) ([]byte, uploadedImage, error) {
+func (b *Bot) fetchAndUpload(ctx context.Context, item jellyfin.Item, size int, encrypt bool) ([]byte, uploadedImage, error) {
 	data, mime, err := b.jf.Artwork(ctx, item, size)
 	if err != nil {
 		return nil, uploadedImage{}, err
 	}
-	resp, err := b.client.UploadBytesWithName(ctx, data, mime, coverFileName(item))
-	if err != nil {
-		return nil, uploadedImage{}, fmt.Errorf("upload artwork: %w", err)
-	}
 
-	img := uploadedImage{URI: resp.ContentURI.CUString(), Mime: mime, Size: len(data)}
+	img := uploadedImage{Mime: mime, Size: len(data)}
+	if encrypt {
+		// The media repo only ever sees ciphertext, so it gets no hint of
+		// what it is holding either.
+		file := attachment.NewEncryptedFile()
+		resp, err := b.client.UploadBytes(ctx, file.Encrypt(data), "application/octet-stream")
+		if err != nil {
+			return nil, uploadedImage{}, fmt.Errorf("upload artwork: %w", err)
+		}
+		img.File = &event.EncryptedFileInfo{EncryptedFile: *file, URL: resp.ContentURI.CUString()}
+	} else {
+		resp, err := b.client.UploadBytesWithName(ctx, data, mime, coverFileName(item))
+		if err != nil {
+			return nil, uploadedImage{}, fmt.Errorf("upload artwork: %w", err)
+		}
+		img.URI = resp.ContentURI.CUString()
+	}
 	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 		img.Width, img.Height = cfg.Width, cfg.Height
 	}

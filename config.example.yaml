@@ -3,15 +3,33 @@ matrix:
   user_id: "@musicbot:example.org"
   access_token: "syt_..."
   device_id: "MUSICBOT"
-  # The room the bot listens in and streams into. It MUST be unencrypted:
-  # Element Call only runs the call without media E2EE in unencrypted rooms,
-  # and this bot publishes plain Opus.
+  # The room the bot listens in and streams into. An encrypted room needs the
+  # crypto section below.
   room_id: "!streaming:example.org"
   # Users allowed to run control commands (!stop, !clear, !skip).
   # Leave empty to let everyone control the bot.
   admins:
     - "@you:example.org"
   command_prefix: "!"
+
+  # End-to-end encryption, for an encrypted room. Element Call encrypts the
+  # call media whenever the room is encrypted, so the bot encrypts both its
+  # messages and its audio there. Leave store empty for an unencrypted room;
+  # the bot refuses an encrypted one without it.
+  #
+  # The access token must belong to a device that has never had encryption
+  # keys, or that this store already holds: a device whose keys were made
+  # elsewhere cannot be taken over. A fresh login for the bot is simplest.
+  crypto:
+    # SQLite database for the Olm account and Megolm sessions. Keep it: a bot
+    # that loses it is a new device nobody has shared keys with.
+    store: ""            # e.g. /data/crypto.db
+    # Encrypts the secrets in the store at rest. Optional.
+    pickle_key: ""
+    # A file holding the account's recovery key. With it the bot cross-signs
+    # its own device at startup, so clients show it as verified. Run the bot
+    # once with -setup-cross-signing to make one.
+    recovery_key_file: ""
 
 rtc:
   # Optional. Leave empty to discover the MatrixRTC authorization service from

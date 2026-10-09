@@ -17,7 +17,11 @@ ARG BUILD_TIME=unknown
 # CGO_ENABLED=0 keeps the binary static. The bot deliberately has no cgo
 # dependencies: audio and video are encoded by the ffmpeg binary rather than by
 # linking libopus and libx264 into the process.
+#
+# -tags goolm selects mautrix's pure-Go Olm. Without it mautrix links libolm
+# through cgo, and with CGO_ENABLED=0 the build fails outright.
 RUN CGO_ENABLED=0 go build \
+        -tags goolm \
         -trimpath \
         -ldflags="-s -w \
             -X main.version=${TAG} \
@@ -47,7 +51,9 @@ COPY --from=build /out/musicbot /usr/local/bin/musicbot
 RUN musicbot -check
 
 # Nothing here needs root.
-RUN adduser -D -u 1000 musicbot
+RUN adduser -D -u 1000 musicbot \
+    && mkdir /data \
+    && chown musicbot:musicbot /data
 USER musicbot
 
 # Repeat the check as the unprivileged user, so a permissions problem shows up
@@ -56,7 +62,10 @@ RUN musicbot -check
 
 # The config carries an access token and an API key, so it is mounted rather
 # than baked in: -v ./config.yaml:/config/config.yaml:ro
-VOLUME ["/config"]
+#
+# /data is for the encryption store (matrix.crypto.store), which an encrypted
+# room needs and which has to outlive the container: -v ./data:/data
+VOLUME ["/config", "/data"]
 
 ENTRYPOINT ["/usr/local/bin/musicbot"]
 CMD ["-config", "/config/config.yaml"]

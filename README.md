@@ -145,24 +145,63 @@ Both halves of "being in a call" can fail on their own, so both are watched:
 - A Jellyfin server with an API key
 
 There are no cgo dependencies: audio is encoded by ffmpeg rather than by linking
-libopus into the binary.
+libopus into the binary, and encryption uses mautrix's pure-Go Olm (`-tags
+goolm`) and a pure-Go SQLite. Build and test with that tag; without it mautrix
+wants libolm through cgo.
 
-## The room must be unencrypted
+## Encrypted rooms
 
-**This is a hard constraint, not a preference.** In an encrypted room Element
-Call encrypts call media end-to-end (SFrame, with per-participant keys exchanged
-over Olm-encrypted room events). This bot publishes plain Opus, so in an
-encrypted room other participants would receive audio they cannot decrypt.
+The bot works in an encrypted room once `matrix.crypto.store` is set. There are
+two halves to it, and they only work together: Element Call encrypts the call
+media whenever the room is encrypted, so a bot that could read encrypted
+commands but published plain audio would be heard as noise.
 
-Use a dedicated, unencrypted room for streaming. Element Call runs the call
-without media E2EE there, and everything works.
+- **Messages.** Commands are decrypted and replies encrypted with Megolm, and
+  album art is uploaded as an encrypted attachment. The Olm account and the
+  Megolm sessions live in the SQLite store, which has to survive restarts.
+- **Call media.** Every Opus frame, and the album art video, is encrypted with
+  AES-GCM the way LiveKit's frame cryptor does it. The key is the bot's own,
+  sent to each device in the call as an Olm-encrypted
+  `io.element.call.encryption_keys` to-device message, and rotated as Element
+  Call rotates its own: a new key when somebody leaves, and when somebody joins
+  a key that has been in use a while. The bot never subscribes to anybody, so
+  it has no need of their keys.
+
+Call memberships stay unencrypted, as other MatrixRTC clients send them.
+
+The access token must be for a device that has never had encryption keys, or
+whose keys are already in the store: the bot cannot take over a device that
+made its keys elsewhere. A fresh login for the bot is simplest.
+
+### Verifying the bot
+
+People whose clients only share keys with verified sessions will not be read by
+the bot until it is verified; it says so in the room when that happens. The
+bot can cross-sign its own device, which most clients then show as verified
+by its owner:
+
+```sh
+# Once: make a cross-signing identity for the bot's account. Needs the account
+# password, read from MUSICBOT_PASSWORD or standard input, and prints the
+# recovery key.
+./musicbot -config config.yaml -setup-cross-signing > recovery-key.txt
+```
+
+Then point `matrix.crypto.recovery_key_file` at that file, and the bot signs its
+device with it on every start. The recovery key unlocks the cross-signing keys
+but cannot log in, which is why it, and not the password, is what lives next to
+the config. If the account already has a cross-signing identity, skip the
+setup and put its existing recovery key in the file.
+
+Self-signing does not settle trust between people: someone who verifies every
+user they talk to still has to verify the bot once, as they would anyone else.
 
 ## Setup
 
 ```sh
 cp config.example.yaml config.yaml
 $EDITOR config.yaml
-go build ./cmd/musicbot
+go build -tags goolm ./cmd/musicbot
 ./musicbot -config config.yaml
 ```
 
@@ -188,7 +227,17 @@ Or directly:
 ```sh
 docker run -d --name musicbot \
   -v ./config.yaml:/config/config.yaml:ro \
+  -v ./data:/data \
   ghcr.io/ricardo-duarte-av/jellyfin-to-matrix-music-bot:latest
+```
+
+`/data` holds the encryption store (`matrix.crypto.store: /data/crypto.db`) and
+must be writable by uid 1000. An unencrypted room does not need it.
+
+To set up cross-signing in the container:
+
+```sh
+docker compose run --rm -it musicbot -config /config/config.yaml -setup-cross-signing
 ```
 
 The config is mounted rather than baked in, since it carries an access token and
@@ -200,7 +249,8 @@ the SFU, whose address it learns at runtime — so it needs no published ports a
 works behind the default bridge network.
 
 The image is Alpine with ffmpeg, the DejaVu font for the placeholder tile, and a
-static binary — the bot has no cgo dependencies, so nothing else is needed. The
+static binary — the bot has no cgo dependencies, encryption included, so nothing
+else is needed. The
 build fails rather than the first playback if ffmpeg lacks libopus or libx264.
 
 To build it yourself:
@@ -386,8 +436,8 @@ CRF 20 lands a cover at roughly 75KB, which is nothing spread over a track.
 ## Testing
 
 ```sh
-go test ./...          # includes a real ffmpeg -> Opus -> publisher run
-go test -race ./...
+go test -tags goolm ./...          # includes a real ffmpeg -> Opus -> publisher run
+go test -tags goolm -race ./...
 ```
 
 The player tests generate tones with ffmpeg and push them through the entire
@@ -396,7 +446,10 @@ homeserver or a LiveKit server.
 
 ## Limitations
 
-- No media E2EE, hence the unencrypted-room requirement above.
+- In an encrypted room, a client that reads both MatrixRTC dialects and sees
+  the bot on both files the media key under one of its memberships only, so one
+  of the two tiles stays silent. `auto` mode, the default, avoids that by being
+  on one dialect per client.
 - One room per bot process.
 - In `both` mode, or in `auto` mode with a legacy-only client and a sticky-only
   client in the same call, the bot holds two SFU connections, so its upstream

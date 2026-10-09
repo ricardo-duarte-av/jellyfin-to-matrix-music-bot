@@ -11,6 +11,11 @@ services:
       # The config carries a Matrix access token and a Jellyfin API key, so it
       # is mounted read-only rather than baked into an image.
       - ./config.yaml:/config/config.yaml:ro
+      # The encryption store, for an encrypted room (matrix.crypto.store:
+      # /data/crypto.db). It must survive the container: a bot that loses it
+      # comes back as a device nobody has shared keys with. The directory has
+      # to be writable by uid 1000, which the bot runs as.
+      - ./data:/data
 
     environment:
       # Only affects log timestamps.
@@ -22,7 +27,8 @@ services:
     # fine. ICE works from behind the bridge NAT.
 
     # Nothing is written outside /tmp, which is where ffmpeg's placeholder text
-    # files go. If you ever see a permissions error, drop these two lines.
+    # files go, and /data, which is a volume. If you ever see a permissions
+    # error, drop these two lines.
     read_only: true
     tmpfs:
       - /tmp

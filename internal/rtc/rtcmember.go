@@ -311,12 +311,18 @@ func (m *StickyMembership) refresh(stop <-chan struct{}, done chan<- struct{}) {
 // Two events sharing a sticky key are tie-broken on origin_server_ts first, so
 // sending two within the same millisecond risks the older one winning and the
 // update being silently undone. A millisecond of spacing rules that out.
+//
+// Membership goes out in the clear even in an encrypted room, as other
+// MatrixRTC clients send it: the client would otherwise encrypt it the moment
+// the room has a crypto helper, and a member that has not yet got the Megolm
+// session could not see the bot in the call at all.
 func (m *StickyMembership) sendLocked(ctx context.Context, content *StickyMemberContent) error {
 	if since := time.Since(m.lastSend); !m.lastSend.IsZero() && since < time.Millisecond {
 		time.Sleep(time.Millisecond - since)
 	}
 	_, err := m.client.SendMessageEvent(ctx, m.roomID, StickyMemberEventType, content, mautrix.ReqSendEvent{
 		UnstableStickyDuration: m.duration,
+		DontEncrypt:            true,
 	})
 	m.lastSend = time.Now()
 	return err
@@ -329,6 +335,7 @@ func (m *StickyMembership) armDelayedLeaveLocked(ctx context.Context) error {
 		m.leaveContent(), mautrix.ReqSendEvent{
 			UnstableDelay:          delayedLeaveTimeout,
 			UnstableStickyDuration: m.duration,
+			DontEncrypt:            true,
 		})
 	if err != nil {
 		return err

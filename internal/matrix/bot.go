@@ -61,6 +61,17 @@ type Bot struct {
 	// bot is not on its way out.
 	leaveTimer *time.Timer
 
+	// mediaKeys is handed the devices in the call whenever that may have
+	// changed, so the bot's call media key reaches them. Nil when the call
+	// media is not encrypted.
+	mediaKeys func(targets []rtc.KeyTarget)
+	// crypto is the room encryption, nil when the bot has none.
+	crypto *Crypto
+	// undecryptable rate-limits the notice about messages the bot could not
+	// read, per sender.
+	undecryptableMu sync.Mutex
+	undecryptable   map[id.UserID]time.Time
+
 	// settleMu guards settleTimer, the pending decision on a burst of
 	// membership changes; see audienceChanged.
 	settleMu    sync.Mutex
@@ -80,6 +91,10 @@ type call interface {
 	// wants. It does nothing for a bot that is not in the call.
 	Reconcile(ctx context.Context) error
 }
+
+// SetMediaKeys attaches the sharer of the call media key: share is told the
+// devices in the call every time they may have changed.
+func (b *Bot) SetMediaKeys(share func(targets []rtc.KeyTarget)) { b.mediaKeys = share }
 
 // SetCall attaches the call the bot comes and goes from. Without it the bot
 // stays wherever it was put, pausing and resuming but never leaving.
@@ -232,6 +247,7 @@ func (b *Bot) primeCallWatcher(ctx context.Context) {
 				continue
 			}
 			b.calls.applyLegacy(evt.Sender, stateKey, true)
+			b.calls.noteLegacySession(stateKey, legacySession(evt))
 		}
 	}
 	b.calls.prime()
@@ -563,8 +579,10 @@ func (b *Bot) cmdEject(ctx context.Context, cmd Command) {
 		b.reply(ctx, plain, formatted)
 		// Ejecting the last listener empties the call. The redacted sticky
 		// memberships are dropped here rather than through a sync handler, so
-		// nothing else would notice.
+		// nothing else would notice. The ejected devices must not get the next
+		// media key either.
 		b.followAudience(ctx)
+		b.followDialects(ctx)
 	}
 }
 

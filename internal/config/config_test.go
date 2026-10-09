@@ -173,3 +173,28 @@ func TestIsAdmin(t *testing.T) {
 		t.Error("with an empty admin list everyone should be allowed")
 	}
 }
+
+// Encryption is off unless a store is named, and a named store works without
+// a pickle key spelled out.
+func TestCryptoIsOptIn(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Matrix.Crypto.Enabled() {
+		t.Error("encryption on with no store configured")
+	}
+
+	body := strings.Replace(validConfig, `  admins: ["@me:example.org"]`,
+		"  admins: [\"@me:example.org\"]\n  crypto:\n    store: /data/crypto.db", 1)
+	cfg, err = Load(write(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Matrix.Crypto.Enabled() || cfg.Matrix.Crypto.Store != "/data/crypto.db" {
+		t.Errorf("crypto = %+v; want enabled on /data/crypto.db", cfg.Matrix.Crypto)
+	}
+	if cfg.Matrix.Crypto.PickleKey == "" {
+		t.Error("no default pickle key")
+	}
+}

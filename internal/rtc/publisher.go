@@ -34,6 +34,9 @@ type Publisher struct {
 	pub   *lksdk.LocalTrackPublication
 
 	video *videoTrack
+	// keys encrypts every frame when the room is encrypted; nil sends media in
+	// the clear.
+	keys *MediaKeys
 
 	// lost is called once the SDK gives up on the connection, and dropped
 	// records that it has. A dropped connection is dead for good: the SDK's own
@@ -56,8 +59,12 @@ const videoRefresh = 10 * time.Second
 // places that have to agree, or listeners get a downmix: the RTP codec
 // parameters, the SDP fmtp offered to subscribers, and the AddTrackRequest the
 // SFU uses when describing the track onwards.
-func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, error) {
-	p := &Publisher{}
+//
+// keys, when not nil, encrypts the media end to end the way Element Call does
+// in an encrypted room. Element Call decides that from the room, not from the
+// track, so in an encrypted room an unencrypted track is noise to everybody.
+func Connect(cfg *SFUConfig, displayName string, channels int, keys *MediaKeys) (*Publisher, error) {
+	p := &Publisher{keys: keys}
 	room, err := lksdk.ConnectToRoomWithToken(cfg.URL, cfg.JWT, &lksdk.RoomCallback{
 		OnDisconnected: p.dropConnection,
 	}, lksdk.WithAutoSubscribe(false))
@@ -71,12 +78,17 @@ func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, erro
 		fmtp += ";stereo=1;sprop-stereo=1"
 	}
 
+	trackOpts, encryption, err := encryptionOptions(keys, lksdk.CodecOpus)
+	if err != nil {
+		room.Disconnect()
+		return nil, err
+	}
 	track, err := lksdk.NewLocalSampleTrack(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeOpus,
 		ClockRate:   SampleRate,
 		Channels:    uint16(channels),
 		SDPFmtpLine: fmtp,
-	})
+	}, trackOpts...)
 	if err != nil {
 		room.Disconnect()
 		return nil, fmt.Errorf("create audio track: %w", err)
@@ -88,6 +100,7 @@ func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, erro
 		Stereo: stereo,
 		// The encoder never emits DTX, so do not let the SFU advertise it.
 		DisableDTX: true,
+		Encryption: encryption,
 	})
 	if err != nil {
 		room.Disconnect()
@@ -98,6 +111,20 @@ func Connect(cfg *SFUConfig, displayName string, channels int) (*Publisher, erro
 	p.room, p.track, p.pub = room, track, pub
 	p.mu.Unlock()
 	return p, nil
+}
+
+// encryptionOptions is what a track needs to be encrypted with keys: the frame
+// encryptor, and the encryption type the SFU passes on so subscribers know to
+// decrypt. Nil keys mean neither.
+func encryptionOptions(keys *MediaKeys, codec lksdk.Codec) ([]lksdk.LocalTrackOptions, livekit.Encryption_Type, error) {
+	if keys == nil {
+		return nil, livekit.Encryption_NONE, nil
+	}
+	enc, err := keys.FrameEncryptor(codec)
+	if err != nil {
+		return nil, livekit.Encryption_NONE, fmt.Errorf("create frame encryptor: %w", err)
+	}
+	return []lksdk.LocalTrackOptions{lksdk.WithFrameEncryptor(enc)}, livekit.Encryption_GCM, nil
 }
 
 // OnLost registers the callback fired when the connection drops for good. It
@@ -160,7 +187,7 @@ func (p *Publisher) WriteOpus(frame []byte) error {
 // bot works as an audio-only participant if this fails or is never called.
 func (p *Publisher) PublishVideo(name string) error {
 	p.mu.Lock()
-	room := p.room
+	room, keys := p.room, p.keys
 	if room == nil {
 		p.mu.Unlock()
 		return fmt.Errorf("publisher is closed")
@@ -171,7 +198,7 @@ func (p *Publisher) PublishVideo(name string) error {
 	}
 	p.mu.Unlock()
 
-	video, err := newVideoTrack(room, name)
+	video, err := newVideoTrack(room, name, keys)
 	if err != nil {
 		return err
 	}

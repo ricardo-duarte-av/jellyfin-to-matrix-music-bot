@@ -2,9 +2,11 @@ package matrix
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,10 @@ type callWatcher struct {
 	// ones that arrived with a sender. It is what lines a legacy membership up
 	// with a sticky one from the same client.
 	legacyDevice map[string]callDevice
+	// legacySession tells one visit to the call from the next for each of
+	// those state keys: a client that leaves and rejoins reuses its state key,
+	// and only this shows it has lost the media keys it had.
+	legacySession map[string]string
 	// sticky holds MSC4143 memberships, keyed by sender and sticky key. These
 	// are message events rather than state, so they are tracked separately and
 	// expire on a timer instead of being retracted.
@@ -73,6 +79,9 @@ type stickyEntry struct {
 	// device is the member.device_id the membership was published for, empty
 	// when the client did not say.
 	device id.DeviceID
+	// member is the member.id, which a client picks afresh every time it
+	// joins.
+	member string
 }
 
 // callDevice is one client in the call, whichever dialects it publishes.
@@ -83,9 +92,10 @@ type callDevice struct {
 
 func newCallWatcher() *callWatcher {
 	return &callWatcher{
-		present:      make(map[string]bool),
-		legacyDevice: make(map[string]callDevice),
-		sticky:       make(map[stickyHandle]*stickyEntry),
+		present:       make(map[string]bool),
+		legacyDevice:  make(map[string]callDevice),
+		legacySession: make(map[string]string),
+		sticky:        make(map[stickyHandle]*stickyEntry),
 	}
 }
 
@@ -125,6 +135,7 @@ func (w *callWatcher) applyLegacy(userID id.UserID, stateKey string, joined bool
 	} else {
 		delete(w.present, stateKey)
 		delete(w.legacyDevice, stateKey)
+		delete(w.legacySession, stateKey)
 	}
 	after := w.handlesLocked(userID, now)
 
@@ -245,6 +256,74 @@ func (w *callWatcher) dialects(self id.UserID, now time.Time) dialectNeeds {
 	return needs
 }
 
+// noteLegacySession records which visit to the call a legacy membership is.
+func (w *callWatcher) noteLegacySession(stateKey, session string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.present[stateKey] {
+		w.legacySession[stateKey] = session
+	}
+}
+
+// legacySession identifies one visit to the call by a legacy membership: its
+// created_ts, which survives the renewals a client sends while it stays, or
+// the event itself when the client did not say.
+func legacySession(evt *event.Event) string {
+	var content struct {
+		CreatedTS int64 `json:"created_ts"`
+	}
+	if err := json.Unmarshal(evt.Content.VeryRaw, &content); err == nil && content.CreatedTS != 0 {
+		return strconv.FormatInt(content.CreatedTS, 10)
+	}
+	return evt.ID.String()
+}
+
+// keyTargets lists the devices in the call other than self's, which are the
+// ones the bot's media key has to reach.
+//
+// A device in the call on both dialects is one target, whose session is both
+// of its sessions together. Two targets for one device would hand the key
+// sharer two answers about the same device, and it would see them alternate.
+// Memberships that do not say which device they are for cannot be sent
+// anything, and are left out.
+func (w *callWatcher) keyTargets(self id.UserID, now time.Time) []rtc.KeyTarget {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	sessions := make(map[rtc.KeyTarget][]string)
+	add := func(user id.UserID, device id.DeviceID, session string) {
+		if user == self || user == "" || device == "" {
+			return
+		}
+		d := rtc.KeyTarget{User: user, Device: device}
+		sessions[d] = append(sessions[d], session)
+	}
+	for stateKey := range w.present {
+		d, ok := w.legacyDevice[stateKey]
+		if !ok || d.device == stateKey {
+			continue
+		}
+		add(d.user, id.DeviceID(d.device), "legacy:"+w.legacySession[stateKey])
+	}
+	for handle, entry := range w.sticky {
+		if !entry.joined || !entry.expiresAt.After(now) {
+			continue
+		}
+		add(handle.sender, entry.device, "sticky:"+entry.member)
+	}
+
+	targets := make([]rtc.KeyTarget, 0, len(sessions))
+	for d, parts := range sessions {
+		slices.Sort(parts)
+		d.Session = strings.Join(parts, "|")
+		targets = append(targets, d)
+	}
+	slices.SortFunc(targets, func(a, b rtc.KeyTarget) int {
+		return strings.Compare(a.User.String()+"|"+a.Device.String(), b.User.String()+"|"+b.Device.String())
+	})
+	return targets
+}
+
 // legacyDeviceID pulls the device out of a session-style state key, which is
 // "_<user>_<device>_<application>" or the older "<user>_<device>". The user is
 // known, so underscores in its localpart do not get in the way. A key naming no
@@ -277,11 +356,12 @@ func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.
 	}
 
 	var device id.DeviceID
+	var member string
 	if content, err := rtc.ParseStickyMember(evt); err == nil {
-		device = content.Member.DeviceID
+		device, member = content.Member.DeviceID, content.Member.ID
 	}
 	before := w.handlesLocked(evt.Sender, now)
-	w.sticky[handle] = &stickyEntry{joined: joined, expiresAt: expiresAt, score: score, eventID: eventID, device: device}
+	w.sticky[handle] = &stickyEntry{joined: joined, expiresAt: expiresAt, score: score, eventID: eventID, device: device, member: member}
 	after := w.handlesLocked(evt.Sender, now)
 
 	if !w.stickyPrimed {
@@ -410,6 +490,7 @@ func (b *Bot) handleCallMember(ctx context.Context, evt *event.Event) {
 	// An empty content is a membership being retracted, i.e. a leave.
 	joined := !isEmptyMembership(evt)
 	change := b.calls.applyLegacy(evt.Sender, *evt.StateKey, joined)
+	b.calls.noteLegacySession(*evt.StateKey, legacySession(evt))
 	b.client.Log.Debug().
 		Str("state_key", *evt.StateKey).
 		Str("sender", evt.Sender.String()).
@@ -544,6 +625,10 @@ func (b *Bot) audienceChanged() {
 func (b *Bot) followDialects(ctx context.Context) {
 	b.audience.Lock()
 	defer b.audience.Unlock()
+	// Whatever the membership change did, the media key follows: a newcomer
+	// needs it, a departure means a new one, and a move between dialects means
+	// handing it out again under the new membership.
+	defer b.shareKeys()
 	if b.call == nil || !b.call.Joined() {
 		return
 	}
@@ -647,6 +732,15 @@ func (b *Bot) leaveEmptyCall() {
 	defer cancel()
 	if err := b.call.Leave(ctx); err != nil {
 		b.client.Log.Err(err).Msg("could not leave the empty call")
+	}
+	b.shareKeys()
+}
+
+// shareKeys tells the media key sharer who is in the call now. It does not
+// block: the sharing happens on the sharer's own goroutine.
+func (b *Bot) shareKeys() {
+	if b.mediaKeys != nil {
+		b.mediaKeys(b.calls.keyTargets(b.client.UserID, time.Now()))
 	}
 }
 

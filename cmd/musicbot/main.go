@@ -3,16 +3,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/daedric/jellyfin-to-matrix-music-bot/internal/artwork"
@@ -36,6 +40,9 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	check := flag.Bool("check", false, "check ffmpeg, its encoders and the artwork renderer, then exit")
 	ffmpegPath := flag.String("ffmpeg", "ffmpeg", "ffmpeg binary to use with -check")
+	setupCrossSigning := flag.Bool("setup-cross-signing", false,
+		"give the bot's account a cross-signing identity, print its recovery key, and exit; "+
+			"the account password is read from "+passwordEnv+" or standard input")
 	flag.Parse()
 
 	if *showVersion {
@@ -52,7 +59,7 @@ func main() {
 		return
 	}
 
-	if err := run(*configPath); err != nil {
+	if err := run(*configPath, *setupCrossSigning); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -62,7 +69,11 @@ func main() {
 // context that drove the bot has already been cancelled.
 const leaveTimeout = 15 * time.Second
 
-func run(configPath string) error {
+// passwordEnv is where -setup-cross-signing looks for the account password
+// before asking for it.
+const passwordEnv = "MUSICBOT_PASSWORD"
+
+func run(configPath string, setupCrossSigning bool) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -104,6 +115,32 @@ func run(configPath string) error {
 	client.DeviceID = id.DeviceID(deviceID)
 	client.Log.Info().Str("user_id", cfg.Matrix.UserID).Str("device_id", deviceID).Msg("matrix client ready")
 
+	// Encryption is set up before anything else touches the sync loop: the
+	// handlers registered later only see decrypted events if it is.
+	var crypto *matrix.Crypto
+	if cfg.Matrix.Crypto.Enabled() {
+		crypto, err = matrix.SetupCrypto(ctx, client, cfg.Matrix.Crypto)
+		if err != nil {
+			return err
+		}
+		defer crypto.Close()
+		client.Log.Info().Str("store", cfg.Matrix.Crypto.Store).Msg("end-to-end encryption ready")
+	}
+	if setupCrossSigning {
+		return runSetupCrossSigning(ctx, crypto)
+	}
+	if crypto != nil {
+		if path := cfg.Matrix.Crypto.RecoveryKeyFile; path != "" {
+			if err := crypto.VerifyWithRecoveryKeyFile(ctx, path); err != nil {
+				return err
+			}
+			client.Log.Info().Msg("cross-signed this device with the account's recovery key")
+		} else {
+			client.Log.Info().Msg("no recovery key configured, so this device is not cross-signed; " +
+				"see -setup-cross-signing")
+		}
+	}
+
 	jf := jellyfin.New(cfg.Jellyfin.Server, cfg.Jellyfin.APIKey, cfg.Jellyfin.UserID)
 	if err := jf.Ping(ctx); err != nil {
 		return err
@@ -114,6 +151,62 @@ func run(configPath string) error {
 	if _, err := client.JoinRoomByID(ctx, roomID); err != nil {
 		return fmt.Errorf("join room %s: %w", roomID, err)
 	}
+
+	// An encrypted room means encrypted call media: Element Call decides that
+	// from the room, so a bot publishing in the clear there would be heard as
+	// noise. It is read now rather than left to the first sync because the
+	// first connection can be made before that sync is in.
+	var roomEncrypted atomic.Bool
+	var encryption event.EncryptionEventContent
+	if err := client.StateEvent(ctx, roomID, event.StateEncryption, "", &encryption); err == nil && encryption.Algorithm != "" {
+		if crypto == nil {
+			return fmt.Errorf("room %s is encrypted; set matrix.crypto.store in the config to support it", roomID)
+		}
+		roomEncrypted.Store(true)
+		if err := client.StateStore.SetEncryptionEvent(ctx, roomID, &encryption); err != nil {
+			return fmt.Errorf("record room encryption: %w", err)
+		}
+		if err := crypto.RefreshDevices(ctx, roomID); err != nil {
+			client.Log.Warn().Err(err).Msg("could not refresh the room's device lists")
+		}
+		client.Log.Info().Msg("room is encrypted; encrypting messages and call media")
+	}
+	client.Syncer.(mautrix.ExtensibleSyncer).OnEventType(event.StateEncryption, func(_ context.Context, evt *event.Event) {
+		if evt.RoomID != roomID || roomEncrypted.Swap(true) {
+			return
+		}
+		if crypto == nil {
+			client.Log.Error().Msg("the room has just turned on encryption; set matrix.crypto.store and restart, " +
+				"or the bot can neither read commands nor be heard")
+			return
+		}
+		client.Log.Warn().Msg("the room has just turned on encryption; call media is encrypted from the next " +
+			"time the bot joins the call")
+	})
+
+	// The call media key. The keys exist whether or not the room is encrypted,
+	// so a room that turns encryption on finds them ready at the next join.
+	var mediaKeys *rtc.MediaKeys
+	var keyShare *rtc.KeyShare
+	if crypto != nil {
+		mediaKeys, err = rtc.NewMediaKeys()
+		if err != nil {
+			return fmt.Errorf("create media keys: %w", err)
+		}
+		keyShare = rtc.NewKeyShare(log, mediaKeys, crypto.MediaKeySender(roomID))
+		go keyShare.Run(ctx)
+	}
+	// keysForCall is read on every connection, so the decision follows the
+	// room rather than whatever it was at startup.
+	keysForCall := func() *rtc.MediaKeys {
+		if roomEncrypted.Load() {
+			return mediaKeys
+		}
+		return nil
+	}
+	// memberIDs is the member each dialect's membership names, which a media
+	// key has to be filed under.
+	memberIDs := make(map[string]string)
 
 	// Join the call. The bot speaks two MatrixRTC dialects: the session-style
 	// membership Element Call has always used, and the MSC4143 membership with
@@ -177,7 +270,7 @@ func run(configPath string) error {
 			// The LiveKit room is only known once a token has been minted, and
 			// the membership published straight after this has to name it.
 			focus.SetAlias(sfu.Alias)
-			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels(), keysForCall())
 		}
 
 		// A token minted at startup and then thrown away is worth one round
@@ -200,6 +293,7 @@ func run(configPath string) error {
 
 		legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectLegacy, Dial: dial})
 		members = append(members, membership)
+		memberIDs[rtc.DialectLegacy] = membership.MembershipID()
 		alias = sfu.Alias
 	}
 
@@ -224,7 +318,7 @@ func run(configPath string) error {
 			if sfu == nil {
 				return nil, fmt.Errorf("no /get_token endpoint available")
 			}
-			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels())
+			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels(), keysForCall())
 		}
 
 		sfu, err := rtc.GetStickyToken(ctx, client, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
@@ -246,6 +340,7 @@ func run(configPath string) error {
 
 			legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectSticky, Dial: dial})
 			members = append(members, rtc.StickyMember(sticky))
+			memberIDs[rtc.DialectSticky] = sticky.MemberID()
 		}
 	}
 
@@ -350,6 +445,21 @@ func run(configPath string) error {
 	if artPublisher != nil {
 		bot.SetArtPublisher(artPublisher)
 	}
+	if crypto != nil {
+		bot.SetCrypto(crypto)
+		bot.SetMediaKeys(func(targets []rtc.KeyTarget) {
+			if !roomEncrypted.Load() {
+				return
+			}
+			var ids []string
+			for _, dialect := range call.Dialects() {
+				if memberID, ok := memberIDs[dialect]; ok {
+					ids = append(ids, memberID)
+				}
+			}
+			keyShare.Update(targets, ids)
+		})
+	}
 	client.Log.Info().Str("room", cfg.Matrix.RoomID).Msg("listening for commands")
 
 	if err := bot.Run(ctx); err != nil && ctx.Err() == nil {
@@ -357,4 +467,38 @@ func run(configPath string) error {
 	}
 	client.Log.Info().Msg("shutting down")
 	return nil
+}
+
+// runSetupCrossSigning gives the account a cross-signing identity and prints the
+// recovery key for it.
+//
+// It is a one-off rather than something the bot does at startup because it
+// needs the account password, and a password in the config would be full
+// control of the account sitting in a file. The recovery key it prints is
+// narrower: it unlocks the cross-signing keys, but cannot log in.
+func runSetupCrossSigning(ctx context.Context, crypto *matrix.Crypto) error {
+	if crypto == nil {
+		return fmt.Errorf("-setup-cross-signing needs matrix.crypto.store set in the config")
+	}
+	password := os.Getenv(passwordEnv)
+	if password == "" {
+		fmt.Fprint(os.Stderr, "Account password: ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return fmt.Errorf("read password: %w", err)
+		}
+		password = strings.TrimRight(line, "\r\n")
+	}
+	if password == "" {
+		return fmt.Errorf("no password given")
+	}
+	recoveryKey, err := crypto.SetUpCrossSigning(ctx, password)
+	if recoveryKey != "" {
+		// Printed even when signing failed afterwards: the keys are uploaded
+		// by then, and this is the only copy of what unlocks them.
+		fmt.Println(recoveryKey)
+		fmt.Fprintln(os.Stderr, "Save this recovery key in the file matrix.crypto.recovery_key_file points at. "+
+			"It is shown only this once.")
+	}
+	return err
 }

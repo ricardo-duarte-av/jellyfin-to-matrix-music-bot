@@ -74,7 +74,28 @@ type Matrix struct {
 	RoomID        string   `yaml:"room_id"`
 	Admins        []string `yaml:"admins"`
 	CommandPrefix string   `yaml:"command_prefix"`
+	Crypto        Crypto   `yaml:"crypto"`
 }
+
+// Crypto enables end-to-end encryption, which an encrypted room needs: Megolm
+// for the chat, and frame encryption for the call media, since Element Call
+// encrypts the call whenever the room is.
+type Crypto struct {
+	// Store is the SQLite database the Olm account and Megolm sessions live
+	// in. Empty disables encryption, and the bot then refuses an encrypted
+	// room. It has to survive restarts: a bot that loses it has a new identity
+	// nobody has shared keys with, and goes deaf.
+	Store string `yaml:"store"`
+	// PickleKey encrypts the secrets in the store at rest.
+	PickleKey string `yaml:"pickle_key"`
+	// RecoveryKeyFile holds the account's recovery key, with which the bot
+	// cross-signs its own device at startup so clients show it as verified.
+	// Optional; see -setup-cross-signing for making one.
+	RecoveryKeyFile string `yaml:"recovery_key_file"`
+}
+
+// Enabled reports whether the bot speaks end-to-end encryption at all.
+func (c Crypto) Enabled() bool { return c.Store != "" }
 
 // RTC holds MatrixRTC / LiveKit settings.
 type RTC struct {
@@ -174,6 +195,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Matrix.CommandPrefix == "" {
 		c.Matrix.CommandPrefix = "!"
+	}
+	if c.Matrix.Crypto.Enabled() && c.Matrix.Crypto.PickleKey == "" {
+		// The store sits next to the config, which is no more secret than
+		// it is, so a fixed key protects against little; it is a default
+		// only so a config that sets nothing else still works.
+		c.Matrix.Crypto.PickleKey = "jellyfin-to-matrix-music-bot"
 	}
 	if c.RTC.DisplayName == "" {
 		c.RTC.DisplayName = "Jukebox"

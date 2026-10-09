@@ -186,6 +186,17 @@ func (s *Session) Joined() bool {
 	return s.joined
 }
 
+// Dialects names the dialects the bot is in the call on now, none when it is
+// not in the call.
+func (s *Session) Dialects() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.joined {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(s.active))
+}
+
 // Enter connects to the SFU and publishes the bot's memberships.
 //
 // The connection is made before the memberships are published, which is the
