@@ -154,17 +154,18 @@ func (s *Session) ChooseDialects(choose func() []string) {
 	s.choose = choose
 }
 
-// wantedLocked is the set of dialects to be in the call on now. Caller must
-// hold s.mu.
-func (s *Session) wantedLocked() map[string]bool {
+// wantedLocked is the set of dialects to be in the call on now, and whether
+// that came from the call's clients rather than the fallback of every dialect.
+// Caller must hold s.mu.
+func (s *Session) wantedLocked() (wanted map[string]bool, chosen bool) {
 	all := make(map[string]bool, len(s.members))
 	for _, member := range s.members {
 		all[member.Dialect()] = true
 	}
 	if s.choose == nil {
-		return all
+		return all, false
 	}
-	wanted := make(map[string]bool)
+	wanted = make(map[string]bool)
 	for _, name := range s.choose() {
 		if all[name] {
 			wanted[name] = true
@@ -173,9 +174,9 @@ func (s *Session) wantedLocked() map[string]bool {
 	if len(wanted) == 0 {
 		// Nobody to go by, or they only read a dialect this bot cannot speak:
 		// being visible twice beats not being visible.
-		return all
+		return all, false
 	}
-	return wanted
+	return wanted, true
 }
 
 // Joined reports whether the bot is currently in the call.
@@ -208,7 +209,7 @@ func (s *Session) Enter(ctx context.Context) error {
 		s.focus.Use(serviceURL)
 	}
 
-	wanted := s.wantedLocked()
+	wanted, _ := s.wantedLocked()
 	s.publisher.SelectLegs(wanted)
 	if err := s.publisher.Resume(ctx); err != nil {
 		return fmt.Errorf("connect to livekit: %w", err)
@@ -250,14 +251,19 @@ func (s *Session) Enter(ctx context.Context) error {
 // than one seeing it drop out. A dialect that cannot be joined keeps the old
 // ones in place, since leaving them would leave that part of the room with
 // nothing.
+//
+// With no clients to go by — the last one has just left — it keeps the dialects
+// it has. The every-dialect fallback is for picking a way in; applied here it
+// would connect a second leg into a call with nobody in it, moments before the
+// bot leaves that call anyway.
 func (s *Session) Reconcile(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.joined {
 		return nil
 	}
-	wanted := s.wantedLocked()
-	if maps.Equal(wanted, s.active) {
+	wanted, chosen := s.wantedLocked()
+	if !chosen || maps.Equal(wanted, s.active) {
 		return nil
 	}
 

@@ -312,6 +312,29 @@ func TestReconcileKeepsTheOldDialectWhenTheNewOneFails(t *testing.T) {
 	}
 }
 
+// The last client leaving says nothing about which dialects the call reads, so
+// the bot stays on the ones it has rather than connecting every other leg into
+// an empty call.
+func TestReconcileKeepsItsDialectsWhenNobodyIsLeft(t *testing.T) {
+	want := []string{DialectSticky}
+	s, legacy, sticky, conns := twoDialectSession(t, &want)
+	ctx := context.Background()
+	if err := s.Enter(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	want = nil
+	if err := s.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile() = %v", err)
+	}
+	if legacy.joins != 0 || len(conns[DialectLegacy]) != 0 {
+		t.Error("joined the legacy dialect for a call with nobody in it")
+	}
+	if sticky.leaves != 0 {
+		t.Error("left the sticky dialect for a call with nobody in it")
+	}
+}
+
 // Reconcile is for a bot already in the call; it must not drag one in.
 func TestReconcileOutsideTheCallDoesNothing(t *testing.T) {
 	want := []string{DialectSticky}
