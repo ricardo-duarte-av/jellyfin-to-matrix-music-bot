@@ -104,11 +104,20 @@ func run(configPath string, setupCrossSigning bool) error {
 
 	// The device ID must match the one the access token belongs to: it is half
 	// of the LiveKit identity the JWT service derives.
+	//
+	// With encryption it is also the device the Olm account is created for,
+	// and a wrong one is no longer harmless: the homeserver refuses the keys,
+	// and the crypto store is left bound to a device that does not exist. So
+	// the token is always asked then, and a configured ID has to agree.
 	deviceID := cfg.Matrix.DeviceID
-	if deviceID == "" {
+	if deviceID == "" || cfg.Matrix.Crypto.Enabled() {
 		whoami, err := client.Whoami(ctx)
 		if err != nil {
 			return fmt.Errorf("whoami (set matrix.device_id to skip): %w", err)
+		}
+		if deviceID != "" && deviceID != whoami.DeviceID.String() {
+			return fmt.Errorf("matrix.device_id is %q but the access token belongs to device %q; "+
+				"fix it or leave it empty", deviceID, whoami.DeviceID)
 		}
 		deviceID = whoami.DeviceID.String()
 	}
