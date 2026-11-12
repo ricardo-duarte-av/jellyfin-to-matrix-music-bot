@@ -12,13 +12,23 @@ import (
 	"time"
 )
 
-// TransportTypeLiveKit is the only RTC transport this bot supports.
+// TransportTypeLiveKit is the LiveKit transport of earlier MSC4195 drafts. It
+// names an authorization service (livekit_service_url), and the identity it
+// implies is whatever that service's token carries.
 const TransportTypeLiveKit = "livekit"
+
+// TransportTypeMLiveKit is the stable MSC4195 LiveKit transport. It names the
+// SFU itself (url); tokens for it come from the member's homeserver, and
+// clients look for the identity base64(sha256([user_id, member.id])).
+const TransportTypeMLiveKit = "m.livekit"
 
 // Transport is a MatrixRTC "focus" / transport descriptor as it appears in
 // call membership events and in .well-known.
 type Transport struct {
 	Type string `json:"type"`
+	// URL is the SFU's WebSocket address, which a stable m.livekit transport
+	// carries in place of a service.
+	URL string `json:"url,omitempty"`
 	// LiveKitServiceURL is the MatrixRTC authorization service (lk-jwt-service).
 	LiveKitServiceURL string `json:"livekit_service_url,omitempty"`
 	// LiveKitAlias is the SFU room alias, normally the Matrix room ID.

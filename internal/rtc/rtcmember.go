@@ -57,10 +57,17 @@ type StickyMemberInfo struct {
 
 // StickyTransports describes how to exchange media with a member.
 type StickyTransports struct {
-	// Published carries no URLs: under MSC4195 each member's own homeserver
-	// issues the token, and with it the SFU address.
-	Published    []RTCTransport `json:"published"`
-	CanSubscribe []string       `json:"can_subscribe"`
+	// Published is the transport the bot's token came through: the SFU itself
+	// (m.livekit, url) for a token from the homeserver, or the authorization
+	// service (livekit, livekit_service_url) for one from the service. Each
+	// tells clients a different identity to look for.
+	//
+	// A livekit transport naming neither is skipped by matrix-js-sdk, and a
+	// member with no transport it reads has no LiveKit identity to look for:
+	// the bot's tile then sits empty, shown muted and without its artwork,
+	// while its audio plays regardless.
+	Published    []Transport `json:"published"`
+	CanSubscribe []string    `json:"can_subscribe"`
 }
 
 // StickyMemberContent is the content of an m.rtc.member event.
@@ -90,9 +97,12 @@ type StickyMembership struct {
 	deviceID id.DeviceID
 	duration time.Duration
 
-	mu      sync.Mutex
-	delayID id.DelayID
-	joined  bool
+	mu sync.Mutex
+	// transport is what the token for this membership came through, which
+	// the published membership has to name.
+	transport Transport
+	delayID   id.DelayID
+	joined    bool
 	// left records that this membership has been used and given up, so the
 	// next join knows to mint a fresh member ID rather than reuse a retired
 	// one.
@@ -141,6 +151,15 @@ func (m *StickyMembership) MemberID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.memberID
+}
+
+// SetTransport records the transport the token for this membership came
+// through (SFUConfig.Published). Call it before Join, so the membership that
+// goes out names it.
+func (m *StickyMembership) SetTransport(t Transport) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.transport = t
 }
 
 // refreshInterval is how often the membership is re-published. It sits well
@@ -263,12 +282,20 @@ func (m *StickyMembership) joinContent() *StickyMemberContent {
 		},
 		Application: &SlotApplication{Type: applicationCall},
 		Transports: &StickyTransports{
-			Published:    []RTCTransport{{Type: TransportTypeLiveKit}},
-			CanSubscribe: []string{TransportTypeLiveKit},
+			Published:    []Transport{m.publishedLocked()},
+			CanSubscribe: []string{TransportTypeMLiveKit, TransportTypeLiveKit},
 		},
 		Versions:  []string{},
 		StickyKey: m.memberID,
 	}
+}
+
+// publishedLocked is the transport to advertise. Caller must hold m.mu.
+func (m *StickyMembership) publishedLocked() Transport {
+	if m.transport.Type == "" {
+		return Transport{Type: TransportTypeLiveKit}
+	}
+	return m.transport
 }
 
 // leaveContent is the membership that takes the bot out of the call.

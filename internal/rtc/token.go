@@ -44,6 +44,10 @@ type SFUConfig struct {
 	Identity string `json:"-"`
 	// Source is the endpoint that issued this token.
 	Source TokenSource `json:"-"`
+	// Published is the transport a membership using this token must
+	// advertise. It decides which identity clients look for, so it has to
+	// follow the endpoint the token actually came from.
+	Published Transport `json:"-"`
 }
 
 // legacySFURequest is the body of POST /sfu/get. This endpoint derives the
@@ -78,10 +82,14 @@ type rtcMemberRef struct {
 // homeserverTokenRequest is the body of the MSC4195 Client-Server endpoint.
 // server_name is omitted: it defaults to the homeserver's own name, which is
 // what we want, since we publish our media through our own SFU.
+//
+// The identity it issues is base64(sha256([user_id, member_id])), which is what
+// clients look for behind an m.livekit transport.
 type homeserverTokenRequest struct {
-	RoomID string       `json:"room_id"`
-	SlotID string       `json:"slot_id"`
-	Member rtcMemberRef `json:"member"`
+	URL      string `json:"url"`
+	RoomID   string `json:"room_id"`
+	SlotID   string `json:"slot_id"`
+	MemberID string `json:"member_id"`
 }
 
 // serviceTokenRequest is the body of the authorization service's /get_token.
@@ -141,8 +149,9 @@ func GetSFUConfig(
 
 // GetStickyToken obtains the LiveKit JWT for a sticky m.rtc.member membership.
 //
-// It tries the homeserver's own MSC4195 endpoint first and falls back to the
-// authorization service's. Only a missing endpoint is a reason to fall through:
+// It tries the homeserver's own MSC4195 endpoint first, for the SFU at sfuURL,
+// and falls back to the authorization service's. An empty sfuURL skips the
+// homeserver: its endpoint cannot be asked without naming an SFU. Only a missing endpoint is a reason to fall through:
 // a 401 or 500 is reported, because quietly downgrading a real failure hides
 // the thing that actually needs fixing.
 //
@@ -151,27 +160,31 @@ func GetSFUConfig(
 func GetStickyToken(
 	ctx context.Context,
 	client *mautrix.Client,
+	sfuURL string,
 	serviceURL string,
 	roomID id.RoomID,
 	slotID string,
 	memberID string,
 	deviceID string,
 ) (*SFUConfig, error) {
+	if sfuURL != "" {
+		cfg, err := postHomeserverToken(ctx, client, sfuURL, homeserverTokenRequest{
+			URL:      sfuURL,
+			RoomID:   roomID.String(),
+			SlotID:   slotID,
+			MemberID: memberID,
+		})
+		if err == nil {
+			cfg.Published = Transport{Type: TransportTypeMLiveKit, URL: sfuURL}
+			return finishToken(cfg, TokenSourceHomeserver)
+		}
+		if !isEndpointMissing(err) {
+			return nil, fmt.Errorf("homeserver get_token: %w", err)
+		}
+		client.Log.Debug().Msg("homeserver does not implement /rtc/livekit/get_token; trying the authorization service")
+	}
+
 	member := rtcMemberRef{ID: memberID, ClaimedDeviceID: deviceID}
-
-	cfg, err := postHomeserverToken(ctx, client, homeserverTokenRequest{
-		RoomID: roomID.String(),
-		SlotID: slotID,
-		Member: member,
-	})
-	if err == nil {
-		return finishToken(cfg, TokenSourceHomeserver)
-	}
-	if !isEndpointMissing(err) {
-		return nil, fmt.Errorf("homeserver get_token: %w", err)
-	}
-	client.Log.Debug().Msg("homeserver does not implement /rtc/livekit/get_token; trying the authorization service")
-
 	if serviceURL == "" {
 		return nil, nil
 	}
@@ -180,7 +193,7 @@ func GetStickyToken(
 		return nil, fmt.Errorf("request openid token: %w", err)
 	}
 	member.ClaimedUserID = client.UserID.String()
-	cfg, err = postService(ctx, serviceURL, "/get_token", serviceTokenRequest{
+	cfg, err := postService(ctx, serviceURL, "/get_token", serviceTokenRequest{
 		RoomID:      roomID.String(),
 		SlotID:      slotID,
 		OpenIDToken: openID,
@@ -193,6 +206,7 @@ func GetStickyToken(
 		}
 		return nil, err
 	}
+	cfg.Published = Transport{Type: TransportTypeLiveKit, LiveKitServiceURL: serviceURL}
 	return finishToken(cfg, TokenSourceService)
 }
 
@@ -208,14 +222,19 @@ func finishToken(cfg *SFUConfig, source TokenSource) (*SFUConfig, error) {
 
 // postHomeserverToken calls the MSC4195 Client-Server endpoint. It goes through
 // the mautrix client so the request carries the access token.
-func postHomeserverToken(ctx context.Context, client *mautrix.Client, body homeserverTokenRequest) (*SFUConfig, error) {
+//
+// The response is only the JWT: the SFU is the one the request named.
+func postHomeserverToken(ctx context.Context, client *mautrix.Client, sfuURL string, body homeserverTokenRequest) (*SFUConfig, error) {
 	var cfg SFUConfig
 	url := client.BuildURL(mautrix.ClientURLPath{"v1", "rtc", "livekit", "get_token"})
 	if _, err := client.MakeRequest(ctx, http.MethodPost, url, &body, &cfg); err != nil {
 		return nil, err
 	}
-	if cfg.URL == "" || cfg.JWT == "" {
-		return nil, fmt.Errorf("get_token response missing url or jwt")
+	if cfg.JWT == "" {
+		return nil, fmt.Errorf("get_token response missing jwt")
+	}
+	if cfg.URL == "" {
+		cfg.URL = sfuURL
 	}
 	return &cfg, nil
 }

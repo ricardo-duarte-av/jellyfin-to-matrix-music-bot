@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -115,6 +116,8 @@ func tokenResponse(t *testing.T, alias, identity string) http.HandlerFunc {
 	}
 }
 
+const testSFU = "wss://sfu.example.org:443"
+
 // The homeserver's own endpoint is the top rung: when it answers, nothing else
 // is asked, and in particular no OpenID token is minted.
 func TestStickyTokenPrefersTheHomeserver(t *testing.T) {
@@ -123,7 +126,7 @@ func TestStickyTokenPrefersTheHomeserver(t *testing.T) {
 	svc := &service{}
 	serviceURL := svc.start(t)
 
-	cfg, err := GetStickyToken(context.Background(), client, serviceURL,
+	cfg, err := GetStickyToken(context.Background(), client, testSFU, serviceURL,
 		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE")
 	if err != nil {
 		t.Fatalf("GetStickyToken() = %v", err)
@@ -138,17 +141,54 @@ func TestStickyTokenPrefersTheHomeserver(t *testing.T) {
 		t.Errorf("authorization service was contacted at %q despite the homeserver answering", svc.lastPath)
 	}
 
-	// The identity the SFU assigns is a hash over these three values, so they
-	// must be exactly what the published membership carries.
-	member, _ := hs.lastTokenBody["member"].(map[string]any)
-	if member["id"] != "member-id" || member["claimed_device_id"] != "DEVICE" {
-		t.Errorf("member = %+v; want id=member-id claimed_device_id=DEVICE", member)
+	// The endpoint takes a flat member_id and the SFU it is asked about; the
+	// nested member object of earlier drafts is rejected as M_BAD_JSON.
+	want := map[string]any{
+		"url": testSFU, "room_id": "!room:example.org", "slot_id": DefaultSlotID, "member_id": "member-id",
 	}
-	if hs.lastTokenBody["slot_id"] != DefaultSlotID {
-		t.Errorf("slot_id = %v; want %q", hs.lastTokenBody["slot_id"], DefaultSlotID)
+	if !maps.Equal(hs.lastTokenBody, want) {
+		t.Errorf("get_token body = %v; want %v", hs.lastTokenBody, want)
 	}
-	if _, ok := hs.lastTokenBody["server_name"]; ok {
-		t.Error("server_name was sent; it should default to our own homeserver")
+	// The identity it issues is the one clients look for behind m.livekit.
+	if cfg.Published != (Transport{Type: TransportTypeMLiveKit, URL: testSFU}) {
+		t.Errorf("Published = %+v; want m.livekit at %s", cfg.Published, testSFU)
+	}
+}
+
+// The stable endpoint answers with the JWT alone: the SFU is the one asked for.
+func TestStickyTokenTakesTheSFUFromTheRequest(t *testing.T) {
+	hs := &homeserver{t: t, getToken: func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"jwt": testJWT(t, "alias", "hashed-identity")})
+	}}
+	client, _ := hs.client(t)
+
+	cfg, err := GetStickyToken(context.Background(), client, testSFU, "",
+		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE")
+	if err != nil {
+		t.Fatalf("GetStickyToken() = %v", err)
+	}
+	if cfg.URL != testSFU {
+		t.Errorf("URL = %q; want %q", cfg.URL, testSFU)
+	}
+}
+
+// Without an SFU to name, the homeserver's endpoint cannot be asked at all, so
+// the request goes straight to the service.
+func TestStickyTokenWithoutSFUSkipsTheHomeserver(t *testing.T) {
+	hs := &homeserver{t: t, getToken: func(w http.ResponseWriter, r *http.Request) {
+		t.Error("homeserver get_token was called without an SFU to name")
+	}}
+	client, _ := hs.client(t)
+	svc := &service{getToken: tokenResponse(t, "alias", "hashed-identity")}
+	serviceURL := svc.start(t)
+
+	cfg, err := GetStickyToken(context.Background(), client, "", serviceURL,
+		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE")
+	if err != nil {
+		t.Fatalf("GetStickyToken() = %v", err)
+	}
+	if cfg.Source != TokenSourceService {
+		t.Errorf("Source = %q; want %q", cfg.Source, TokenSourceService)
 	}
 }
 
@@ -160,7 +200,7 @@ func TestStickyTokenFallsThroughToTheService(t *testing.T) {
 	svc := &service{getToken: tokenResponse(t, "alias", "hashed-identity")}
 	serviceURL := svc.start(t)
 
-	cfg, err := GetStickyToken(context.Background(), client, serviceURL,
+	cfg, err := GetStickyToken(context.Background(), client, testSFU, serviceURL,
 		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE")
 	if err != nil {
 		t.Fatalf("GetStickyToken() = %v", err)
@@ -186,6 +226,11 @@ func TestStickyTokenFallsThroughToTheService(t *testing.T) {
 	if member["claimed_user_id"] != "@bot:example.org" {
 		t.Errorf("claimed_user_id = %v; want @bot:example.org", member["claimed_user_id"])
 	}
+	// The service's token carries its own identity, which clients only look
+	// for behind a transport naming that service.
+	if cfg.Published != (Transport{Type: TransportTypeLiveKit, LiveKitServiceURL: serviceURL}) {
+		t.Errorf("Published = %+v; want livekit naming %s", cfg.Published, serviceURL)
+	}
 }
 
 // Neither endpoint existing is a deployment that cannot carry the sticky stack,
@@ -196,7 +241,7 @@ func TestStickyTokenReportsNoEndpoint(t *testing.T) {
 	svc := &service{}
 	serviceURL := svc.start(t)
 
-	cfg, err := GetStickyToken(context.Background(), client, serviceURL,
+	cfg, err := GetStickyToken(context.Background(), client, testSFU, serviceURL,
 		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE")
 	if err != nil {
 		t.Fatalf("GetStickyToken() = %v; want no error", err)
@@ -218,7 +263,7 @@ func TestStickyTokenDoesNotFallThroughOnRefusal(t *testing.T) {
 	svc := &service{getToken: tokenResponse(t, "alias", "identity")}
 	serviceURL := svc.start(t)
 
-	if _, err := GetStickyToken(context.Background(), client, serviceURL,
+	if _, err := GetStickyToken(context.Background(), client, testSFU, serviceURL,
 		id.RoomID("!room:example.org"), DefaultSlotID, "member-id", "DEVICE"); err == nil {
 		t.Fatal("GetStickyToken() = nil error; want the 401 reported")
 	}

@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +45,7 @@ func newTestStickyMembership(t *testing.T) *StickyMembership {
 // the member ID. Diverge and every refresh looks like a second participant.
 func TestJoinContentShape(t *testing.T) {
 	m := newTestStickyMembership(t)
+	m.SetTransport(Transport{Type: TransportTypeLiveKit, LiveKitServiceURL: "https://jwt.example.org"})
 	content := m.joinContent()
 
 	if content.StickyKey != content.Member.ID {
@@ -66,8 +67,6 @@ func TestJoinContentShape(t *testing.T) {
 		content.Transports.Published[0].Type != TransportTypeLiveKit {
 		t.Errorf("published transports = %+v; want one livekit entry", content.Transports)
 	}
-	// The transport carries no URL: under MSC4195 the token, and with it the
-	// SFU address, comes from each member's own homeserver.
 	raw, err := json.Marshal(content)
 	if err != nil {
 		t.Fatal(err)
@@ -83,8 +82,47 @@ func TestJoinContentShape(t *testing.T) {
 	if _, ok := decoded["msc4354_sticky_key"]; !ok {
 		t.Errorf("content is missing the unstable sticky key field: %s", raw)
 	}
-	if got := string(raw); strings.Contains(got, "livekit_service_url") {
-		t.Errorf("published transport leaked a service URL: %s", got)
+	// matrix-js-sdk skips a livekit transport naming no service, and a member
+	// whose transports it skips has no LiveKit identity: Element Call shows
+	// the bot muted and without its artwork while its audio plays regardless.
+	transports, _ := decoded["transports"].(map[string]any)
+	published, _ := transports["published"].([]any)
+	if len(published) != 1 {
+		t.Fatalf("published transports = %v; want one", transports["published"])
+	}
+	entry, _ := published[0].(map[string]any)
+	if got, _ := entry["livekit_service_url"].(string); got != "https://jwt.example.org" {
+		t.Errorf("published livekit_service_url = %q; want the service the token came from", got)
+	}
+	// A url would tell clients to match the MSC4195 identity, which a token
+	// from the service's /get_token is not.
+	if _, ok := entry["url"]; ok {
+		t.Errorf("published transport carries a url: %v", entry)
+	}
+}
+
+// A token from the homeserver carries the MSC4195 identity, which clients only
+// look for behind a stable m.livekit transport naming the SFU — and not if it
+// names a service as well.
+func TestJoinContentPublishesHomeserverTransport(t *testing.T) {
+	m := newTestStickyMembership(t)
+	m.SetTransport(Transport{Type: TransportTypeMLiveKit, URL: "wss://sfu.example.org:443"})
+
+	raw, err := json.Marshal(m.joinContent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Transports struct {
+			Published []map[string]any `json:"published"`
+		} `json:"transports"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"type": "m.livekit", "url": "wss://sfu.example.org:443"}
+	if len(decoded.Transports.Published) != 1 || !maps.Equal(decoded.Transports.Published[0], want) {
+		t.Errorf("published = %v; want [%v]", decoded.Transports.Published, want)
 	}
 }
 

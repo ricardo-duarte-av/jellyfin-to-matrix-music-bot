@@ -316,21 +316,39 @@ func run(configPath string, setupCrossSigning bool) error {
 		if err != nil {
 			return err
 		}
+		// stickyToken mints the token for the membership's current member ID.
+		// It asks the homeserver's registry for its SFU every time rather than
+		// once at startup: a homeserver gaining or losing its own get_token is
+		// a config change, and the bot should follow it without a restart.
+		stickyToken := func(ctx context.Context) (*rtc.SFUConfig, error) {
+			sfuURL, err := rtc.HomeserverSFU(ctx, client)
+			if err != nil {
+				client.Log.Warn().Err(err).Msg("could not read the homeserver's MatrixRTC transports; using the authorization service")
+				sfuURL = ""
+			}
+			return rtc.GetStickyToken(ctx, client, sfuURL, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+		}
 		// The member ID is fixed for the life of this membership and the
 		// LiveKit identity is derived from it, so a reconnection lands back on
 		// the same identity the published membership points at.
 		dial := func(ctx context.Context) (*rtc.Publisher, error) {
-			sfu, err := rtc.GetStickyToken(ctx, client, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+			sfu, err := stickyToken(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("get livekit token for sticky membership: %w", err)
 			}
 			if sfu == nil {
 				return nil, fmt.Errorf("no /get_token endpoint available")
 			}
+			// Connecting comes before the membership goes out, so the
+			// membership names the transport this token actually came
+			// through — and with it, the identity clients look for.
+			sticky.SetTransport(sfu.Published)
+			client.Log.Debug().Str("source", string(sfu.Source)).Str("identity", sfu.Identity).
+				Str("transport", sfu.Published.Type).Msg("got livekit token for sticky membership")
 			return rtc.Connect(sfu, cfg.RTC.DisplayName, cfg.Audio.Channels(), keysForCall())
 		}
 
-		sfu, err := rtc.GetStickyToken(ctx, client, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+		sfu, err := stickyToken(ctx)
 		switch {
 		case err != nil:
 			return fmt.Errorf("get livekit token for sticky membership: %w", err)
