@@ -86,6 +86,10 @@ type stickyEntry struct {
 	// tokens come from its homeserver (m.livekit + url). Only such a client
 	// can see a member publishing one too.
 	homeserverTokens bool
+	// serviceURL is the livekit_service_url the member publishes, if any.
+	serviceURL string
+	// sentAt is the event's origin_server_ts, which orders members by age.
+	sentAt int64
 }
 
 // callDevice is one client in the call, whichever dialects it publishes.
@@ -222,6 +226,31 @@ func (w *callWatcher) othersUseHomeserverTokens(self id.UserID, now time.Time) b
 		seen = true
 	}
 	return seen
+}
+
+// othersServiceURL is the livekit_service_url the oldest other sticky member
+// publishes, or "" when none publishes one.
+//
+// Clients key their SFU connections by the transport as written, so the same
+// service under another spelling — a different path, a trailing slash — is a
+// second connection to the same LiveKit room under the same identity, and the
+// SFU kicks one of the two. Matching the call's own spelling avoids that; the
+// oldest member's is the one the call settled on first.
+func (w *callWatcher) othersServiceURL(self id.UserID, now time.Time) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var url string
+	var oldest int64
+	for handle, entry := range w.sticky {
+		if handle.sender == self || !entry.joined || !entry.expiresAt.After(now) || entry.serviceURL == "" {
+			continue
+		}
+		if url == "" || entry.sentAt < oldest {
+			url, oldest = entry.serviceURL, entry.sentAt
+		}
+	}
+	return url
 }
 
 // Dialects the bot can be in a call on, as the rest of the call reads them.
@@ -385,17 +414,21 @@ func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.
 	var device id.DeviceID
 	var member string
 	var homeserverTokens bool
+	var serviceURL string
 	if content, err := rtc.ParseStickyMember(evt); err == nil {
 		device, member = content.Member.DeviceID, content.Member.ID
 		if content.Transports != nil && len(content.Transports.Published) > 0 {
 			// The first transport is the one a client authenticates against.
-			homeserverTokens = rtc.UsesHomeserverTokens(content.Transports.Published[0])
+			first := content.Transports.Published[0]
+			homeserverTokens = rtc.UsesHomeserverTokens(first)
+			serviceURL = first.LiveKitServiceURL
 		}
 	}
 	before := w.handlesLocked(evt.Sender, now)
 	w.sticky[handle] = &stickyEntry{
 		joined: joined, expiresAt: expiresAt, score: score, eventID: eventID,
 		device: device, member: member, homeserverTokens: homeserverTokens,
+		serviceURL: serviceURL, sentAt: evt.Timestamp,
 	}
 	after := w.handlesLocked(evt.Sender, now)
 
@@ -632,6 +665,13 @@ func (b *Bot) WantedDialects() []string {
 // all see.
 func (b *Bot) StickyMembersUseHomeserverTokens() bool {
 	return b.calls.othersUseHomeserverTokens(b.client.UserID, time.Now())
+}
+
+// StickyServiceURL is the authorization service the call's other sticky
+// members publish, which the bot's sticky membership has to name exactly, or
+// "" when there is none to go by.
+func (b *Bot) StickyServiceURL() string {
+	return b.calls.othersServiceURL(b.client.UserID, time.Now())
 }
 
 // audienceSettle is how long membership changes are left to settle before the

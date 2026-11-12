@@ -350,7 +350,17 @@ func run(configPath string, setupCrossSigning bool) error {
 					client.Log.Warn().Msg("homeserver lists no m.livekit transport; using the authorization service")
 				}
 			}
-			return rtc.GetStickyToken(ctx, client, sfuURL, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
+			// The service is named the way the call's members name it. The
+			// same service spelled differently is, to a client, a second
+			// transport: it connects to it separately, under the same
+			// identity, and the SFU kicks one connection for the other.
+			serviceURL := focus.ServiceURL()
+			if bot != nil {
+				if theirs := bot.StickyServiceURL(); theirs != "" {
+					serviceURL = theirs
+				}
+			}
+			return rtc.GetStickyToken(ctx, client, sfuURL, serviceURL, roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
 		}
 		// The member ID is fixed for the life of this membership and the
 		// LiveKit identity is derived from it, so a reconnection lands back on

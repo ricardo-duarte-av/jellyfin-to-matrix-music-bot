@@ -745,3 +745,28 @@ func TestOthersUseHomeserverTokens(t *testing.T) {
 		t.Error("one member is on the service's flow; want the service so it can see the bot")
 	}
 }
+
+// The bot names the service exactly as the call does: the same service under
+// another spelling makes clients connect to it twice under one identity.
+func TestOthersServiceURLFollowsTheOldestMember(t *testing.T) {
+	const self = id.UserID("@bot:example.org")
+	now := time.Now()
+	join := func(w *callWatcher, sender id.UserID, key string, ts int64, transport rtc.Transport) {
+		evt := withTransport(t, stickyMember(t, sender, "$"+key, key, "join", ts, 10*time.Minute), transport)
+		w.applySticky(evt, true, now.Add(10*time.Minute), key, now)
+	}
+	service := func(url string) rtc.Transport {
+		return rtc.Transport{Type: rtc.TransportTypeLiveKit, LiveKitServiceURL: url}
+	}
+
+	w := primedWatcher()
+	if got := w.othersServiceURL(self, now); got != "" {
+		t.Errorf("empty call: othersServiceURL() = %q; want none", got)
+	}
+	join(w, self, "SELF", now.UnixMilli()-5000, service("https://mine.example.org"))
+	join(w, "@alice:example.org", "ALICE", now.UnixMilli(), service("https://jwt.example.org/livekit/jwt"))
+	join(w, bob, "BOB", now.UnixMilli()-1000, service("https://jwt.example.org/livekit/jwt/"))
+	if got := w.othersServiceURL(self, now); got != "https://jwt.example.org/livekit/jwt/" {
+		t.Errorf("othersServiceURL() = %q; want the oldest other member's spelling", got)
+	}
+}
