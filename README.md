@@ -64,9 +64,19 @@ together. `rtc.stack: both` keeps the bot on both dialects regardless.
 
 The new dialect is used only when the homeserver advertises both
 `org.matrix.msc4143` and `org.matrix.msc4354` in `unstable_features`, and only
-when a `/get_token` endpoint answers — the homeserver's own
-(`/_matrix/client/v1/rtc/livekit/get_token`) is tried before the authorization
-service's. Otherwise the bot runs exactly as it did before. Set
+when a `/get_token` endpoint answers. Otherwise the bot runs exactly as it did
+before.
+
+Where that token comes from decides which clients can see the bot, because
+each source carries a different LiveKit identity behind a different transport.
+The authorization service's `/get_token` is published as
+`{type: livekit, livekit_service_url}`. The homeserver's own
+`/_matrix/client/v1/rtc/livekit/get_token` is published as
+`{type: m.livekit, url}`, with the SFU taken from the homeserver's
+`/rtc/transports`. A client on one flow cannot see a member on the other. So by
+default (`rtc.sticky_transport: auto`) the bot uses the homeserver only when
+every other sticky member in the call publishes `m.livekit`, and the
+authorization service otherwise. `service` and `homeserver` force one. Set
 `rtc.stack: legacy` to opt out entirely, which is also the answer if the bot
 lacks the power level to open an `m.rtc.slot` in the room.
 

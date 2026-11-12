@@ -35,6 +35,14 @@ type Transport struct {
 	LiveKitAlias string `json:"livekit_alias,omitempty"`
 }
 
+// UsesHomeserverTokens reports whether a member publishing t takes its tokens
+// from its homeserver: a LiveKit transport naming the SFU and no service. This
+// is matrix-js-sdk's rule; a transport naming both is the service's.
+func UsesHomeserverTokens(t Transport) bool {
+	return (t.Type == TransportTypeMLiveKit || t.Type == TransportTypeLiveKit) &&
+		t.URL != "" && t.LiveKitServiceURL == ""
+}
+
 // FocusSelection is the deprecated-but-still-required focus_active field of a
 // session-style membership event.
 type FocusSelection struct {

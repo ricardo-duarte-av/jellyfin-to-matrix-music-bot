@@ -695,3 +695,53 @@ func TestAudienceDecisionWaitsForBothMembershipsOfAClient(t *testing.T) {
 		t.Errorf("entered choosing %v; want sticky only", chose)
 	}
 }
+
+// withTransport rewrites a sticky membership to publish t.
+func withTransport(t *testing.T, evt *event.Event, transport rtc.Transport) *event.Event {
+	t.Helper()
+	var content rtc.StickyMemberContent
+	if err := json.Unmarshal(evt.Content.VeryRaw, &content); err != nil {
+		t.Fatal(err)
+	}
+	content.Transports = &rtc.StickyTransports{Published: []rtc.Transport{transport}}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evt.Content.VeryRaw = raw
+	return evt
+}
+
+// The bot takes its sticky token from the homeserver only when every other
+// sticky member does: a client on the service's flow cannot see a member on
+// the homeserver's, which is how a whole call went silent.
+func TestOthersUseHomeserverTokens(t *testing.T) {
+	const self = id.UserID("@bot:example.org")
+	now := time.Now()
+	stable := rtc.Transport{Type: rtc.TransportTypeMLiveKit, URL: "wss://sfu.example.org"}
+	service := rtc.Transport{Type: rtc.TransportTypeLiveKit, LiveKitServiceURL: "https://jwt.example.org"}
+	join := func(w *callWatcher, sender id.UserID, key string, transport rtc.Transport) {
+		evt := withTransport(t, stickyMember(t, sender, "$"+key, key, "join", now.UnixMilli(), 10*time.Minute), transport)
+		w.applySticky(evt, true, now.Add(10*time.Minute), key, now)
+	}
+
+	w := primedWatcher()
+	if w.othersUseHomeserverTokens(self, now) {
+		t.Error("an empty call chose the homeserver; with nobody to go by it should be the service")
+	}
+
+	join(w, self, "SELF", stable)
+	if w.othersUseHomeserverTokens(self, now) {
+		t.Error("the bot's own membership counted towards the choice")
+	}
+
+	join(w, bob, "BOB", stable)
+	if !w.othersUseHomeserverTokens(self, now) {
+		t.Error("every other member is on m.livekit; want the homeserver")
+	}
+
+	join(w, "@alice:example.org", "ALICE", service)
+	if w.othersUseHomeserverTokens(self, now) {
+		t.Error("one member is on the service's flow; want the service so it can see the bot")
+	}
+}

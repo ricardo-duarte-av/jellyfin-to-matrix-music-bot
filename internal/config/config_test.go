@@ -54,6 +54,15 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.RTC.DisplayName != "Jukebox" {
 		t.Errorf("DisplayName = %q; want Jukebox", cfg.RTC.DisplayName)
 	}
+	if cfg.RTC.StickyTransport != StickyTransportAuto {
+		t.Errorf("StickyTransport = %q; want auto", cfg.RTC.StickyTransport)
+	}
+}
+
+func TestLoadRejectsUnknownStickyTransport(t *testing.T) {
+	if _, err := Load(write(t, validConfig+"rtc:\n  sticky_transport: \"sfu\"\n")); err == nil {
+		t.Fatal("Load() accepted rtc.sticky_transport \"sfu\"")
+	}
 }
 
 func TestLoadTrimsTrailingSlashes(t *testing.T) {

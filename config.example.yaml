@@ -64,6 +64,20 @@ rtc:
   # bot lingers in the participant list. MSC4354 caps it at 1h.
   sticky_duration: 10m
 
+  # Where the sticky membership's LiveKit token comes from. Each source gives
+  # the bot an identity clients look for behind a different transport, so the
+  # bot can only be seen by clients that speak that one.
+  #
+  #   service     the authorization service's /get_token, published as
+  #               {type: livekit, livekit_service_url}: what Element Call and
+  #               gomuks-based clients use today.
+  #   homeserver  the homeserver's MSC4195 /rtc/livekit/get_token, published as
+  #               {type: m.livekit, url}. Needs a homeserver that issues
+  #               tokens and lists an m.livekit transport.
+  #   auto        do what the call's other sticky members do: homeserver when
+  #               every one of them publishes m.livekit, service otherwise.
+  sticky_transport: "auto"
+
   # The MatrixRTC slot to join. The default is the room-wide call every calling
   # client uses; change it only if you know you need a separate session.
   slot_id: "m.call#ROOM"

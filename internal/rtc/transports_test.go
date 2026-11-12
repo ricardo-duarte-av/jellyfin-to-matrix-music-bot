@@ -85,3 +85,24 @@ func TestHomeserverSFUWithoutRegistry(t *testing.T) {
 		t.Errorf("HomeserverSFU() = %q, %v; want no SFU and no error", got, err)
 	}
 }
+
+// matrix-js-sdk's rule: a url and no service is the homeserver's flow, anything
+// naming a service is the service's.
+func TestUsesHomeserverTokens(t *testing.T) {
+	cases := []struct {
+		t    Transport
+		want bool
+	}{
+		{Transport{Type: TransportTypeMLiveKit, URL: "wss://sfu"}, true},
+		{Transport{Type: TransportTypeLiveKit, URL: "wss://sfu"}, true},
+		{Transport{Type: TransportTypeLiveKit, LiveKitServiceURL: "https://jwt"}, false},
+		{Transport{Type: TransportTypeLiveKit, URL: "wss://sfu", LiveKitServiceURL: "https://jwt"}, false},
+		{Transport{Type: TransportTypeLiveKit}, false},
+		{Transport{Type: "other", URL: "wss://sfu"}, false},
+	}
+	for _, c := range cases {
+		if got := UsesHomeserverTokens(c.t); got != c.want {
+			t.Errorf("UsesHomeserverTokens(%+v) = %v; want %v", c.t, got, c.want)
+		}
+	}
+}

@@ -115,6 +115,13 @@ type RTC struct {
 	// StickyDuration is how long a published sticky membership stays valid
 	// without a refresh. Capped at an hour by MSC4354.
 	StickyDuration time.Duration `yaml:"sticky_duration"`
+	// StickyTransport decides where the sticky membership's LiveKit token
+	// comes from, and so which transport it publishes: "service" (the
+	// authorization service, published as livekit + livekit_service_url),
+	// "homeserver" (the homeserver's own get_token, published as m.livekit +
+	// url), or "auto" (the default) to do what the call's other sticky
+	// members do. Clients can only see the bot through a flow they speak.
+	StickyTransport string `yaml:"sticky_transport"`
 	// SlotID is the MatrixRTC slot to join. The default is the room-wide call
 	// every calling client uses.
 	SlotID string `yaml:"slot_id"`
@@ -142,6 +149,13 @@ const (
 	StackSticky = "sticky"
 	StackBoth   = "both"
 	StackAuto   = "auto"
+)
+
+// Sticky token sources.
+const (
+	StickyTransportAuto       = "auto"
+	StickyTransportService    = "service"
+	StickyTransportHomeserver = "homeserver"
 )
 
 // UsesLegacy reports whether the session-style membership should be published.
@@ -207,6 +221,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RTC.Stack == "" {
 		c.RTC.Stack = StackAuto
+	}
+	if c.RTC.StickyTransport == "" {
+		c.RTC.StickyTransport = StickyTransportAuto
 	}
 	if c.RTC.StickyDuration <= 0 {
 		c.RTC.StickyDuration = 10 * time.Minute
@@ -282,6 +299,11 @@ func (c *Config) validate() error {
 	case StackLegacy, StackSticky, StackBoth, StackAuto:
 	default:
 		return fmt.Errorf("rtc.stack must be legacy, sticky, both or auto, got %q", c.RTC.Stack)
+	}
+	switch c.RTC.StickyTransport {
+	case StickyTransportAuto, StickyTransportService, StickyTransportHomeserver:
+	default:
+		return fmt.Errorf("rtc.sticky_transport must be auto, service or homeserver, got %q", c.RTC.StickyTransport)
 	}
 	if c.RTC.StickyDuration > time.Hour {
 		return fmt.Errorf("rtc.sticky_duration must not exceed 1h, got %s", c.RTC.StickyDuration)

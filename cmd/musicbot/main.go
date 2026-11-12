@@ -236,6 +236,11 @@ func run(configPath string, setupCrossSigning bool) error {
 
 	membership := rtc.NewMembership(client, roomID, id.UserID(cfg.Matrix.UserID), deviceID)
 
+	// bot is built further down, once the player exists, but the sticky token
+	// source asks it how the call's clients authenticate. Until it exists —
+	// the startup token check — the answer is the service.
+	var bot *matrix.Bot
+
 	// The service the bot would pick for itself, when there is no call in
 	// progress to defer to.
 	preferred := cfg.RTC.LiveKitServiceURL
@@ -316,15 +321,34 @@ func run(configPath string, setupCrossSigning bool) error {
 		if err != nil {
 			return err
 		}
+		// fromHomeserver decides where the sticky token comes from. Under
+		// "auto" it follows the call: the bot can only be seen by clients that
+		// speak the flow its token implies, and today's clients take theirs
+		// from the authorization service.
+		fromHomeserver := func() bool {
+			switch cfg.RTC.StickyTransport {
+			case config.StickyTransportHomeserver:
+				return true
+			case config.StickyTransportService:
+				return false
+			}
+			return bot != nil && bot.StickyMembersUseHomeserverTokens()
+		}
 		// stickyToken mints the token for the membership's current member ID.
-		// It asks the homeserver's registry for its SFU every time rather than
-		// once at startup: a homeserver gaining or losing its own get_token is
-		// a config change, and the bot should follow it without a restart.
+		// The homeserver's registry is asked every time rather than once at
+		// startup, so the bot follows a homeserver gaining or losing its own
+		// get_token without a restart.
 		stickyToken := func(ctx context.Context) (*rtc.SFUConfig, error) {
-			sfuURL, err := rtc.HomeserverSFU(ctx, client)
-			if err != nil {
-				client.Log.Warn().Err(err).Msg("could not read the homeserver's MatrixRTC transports; using the authorization service")
-				sfuURL = ""
+			var sfuURL string
+			if fromHomeserver() {
+				var err error
+				sfuURL, err = rtc.HomeserverSFU(ctx, client)
+				if err != nil {
+					client.Log.Warn().Err(err).Msg("could not read the homeserver's MatrixRTC transports; using the authorization service")
+					sfuURL = ""
+				} else if sfuURL == "" {
+					client.Log.Warn().Msg("homeserver lists no m.livekit transport; using the authorization service")
+				}
 			}
 			return rtc.GetStickyToken(ctx, client, sfuURL, focus.ServiceURL(), roomID, cfg.RTC.SlotID, sticky.MemberID(), deviceID)
 		}
@@ -431,8 +455,8 @@ func run(configPath string, setupCrossSigning bool) error {
 
 	// The bot and the player reference each other: the player reports track
 	// changes to chat, the bot drives the player. Build the player first with a
-	// notify hook that resolves once the bot exists.
-	var bot *matrix.Bot
+	// notify hook that resolves once the bot exists. (bot is declared above,
+	// where the sticky token source also needs it.)
 	encode := player.EncodeOptions{
 		Bitrate:       cfg.Audio.Bitrate,
 		VBR:           cfg.Audio.VBR,

@@ -82,6 +82,10 @@ type stickyEntry struct {
 	// member is the member.id, which a client picks afresh every time it
 	// joins.
 	member string
+	// homeserverTokens records that the member publishes a transport whose
+	// tokens come from its homeserver (m.livekit + url). Only such a client
+	// can see a member publishing one too.
+	homeserverTokens bool
 }
 
 // callDevice is one client in the call, whichever dialects it publishes.
@@ -195,6 +199,29 @@ func (w *callWatcher) anyoneElse(self id.UserID, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// othersUseHomeserverTokens reports whether the call has other sticky members
+// and every one of them takes its tokens from its homeserver.
+//
+// It takes every one, not most: a member on the service's flow cannot see a
+// bot on the homeserver's, while a homeserver-flow client can still read a
+// service transport. With nobody to go by, the answer is no.
+func (w *callWatcher) othersUseHomeserverTokens(self id.UserID, now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	seen := false
+	for handle, entry := range w.sticky {
+		if handle.sender == self || !entry.joined || !entry.expiresAt.After(now) {
+			continue
+		}
+		if !entry.homeserverTokens {
+			return false
+		}
+		seen = true
+	}
+	return seen
 }
 
 // Dialects the bot can be in a call on, as the rest of the call reads them.
@@ -357,11 +384,19 @@ func (w *callWatcher) applySticky(evt *event.Event, joined bool, expiresAt time.
 
 	var device id.DeviceID
 	var member string
+	var homeserverTokens bool
 	if content, err := rtc.ParseStickyMember(evt); err == nil {
 		device, member = content.Member.DeviceID, content.Member.ID
+		if content.Transports != nil && len(content.Transports.Published) > 0 {
+			// The first transport is the one a client authenticates against.
+			homeserverTokens = rtc.UsesHomeserverTokens(content.Transports.Published[0])
+		}
 	}
 	before := w.handlesLocked(evt.Sender, now)
-	w.sticky[handle] = &stickyEntry{joined: joined, expiresAt: expiresAt, score: score, eventID: eventID, device: device, member: member}
+	w.sticky[handle] = &stickyEntry{
+		joined: joined, expiresAt: expiresAt, score: score, eventID: eventID,
+		device: device, member: member, homeserverTokens: homeserverTokens,
+	}
 	after := w.handlesLocked(evt.Sender, now)
 
 	if !w.stickyPrimed {
@@ -589,6 +624,14 @@ func (b *Bot) WantedDialects() []string {
 		dialects = append(dialects, rtc.DialectSticky)
 	}
 	return dialects
+}
+
+// StickyMembersUseHomeserverTokens reports whether the bot's sticky membership
+// should take its token from the homeserver, because every other sticky member
+// in the call does. Otherwise the authorization service's is the one they can
+// all see.
+func (b *Bot) StickyMembersUseHomeserverTokens() bool {
+	return b.calls.othersUseHomeserverTokens(b.client.UserID, time.Now())
 }
 
 // audienceSettle is how long membership changes are left to settle before the
