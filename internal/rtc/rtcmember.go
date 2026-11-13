@@ -145,8 +145,9 @@ func NewStickyMembership(client *mautrix.Client, roomID id.RoomID, slotID string
 // MemberID is the member.id this membership publishes under. The LiveKit
 // identity is derived from it, so the token request must use the same value.
 //
-// It changes when the bot rejoins a call it had left, so anything deriving an
-// identity from it must ask again on every join rather than hold onto it.
+// It changes as soon as the bot leaves a call, ready for the next visit, so
+// anything deriving an identity from it must ask again every time rather than
+// hold onto it.
 func (m *StickyMembership) MemberID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -178,7 +179,8 @@ func (m *StickyMembership) Join(ctx context.Context) error {
 	}
 	// A member ID identifies one join, not one client: a bot that left the call
 	// and is coming back is a new membership, and reusing the retired ID would
-	// have it claim the identity its own leave event just retired.
+	// have it claim the identity its own leave event just retired. Leave renews
+	// it already; this only catches a renewal that failed there.
 	if m.left {
 		memberID, err := newMemberID()
 		if err != nil {
@@ -229,6 +231,13 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Once the leave below has named the retiring member ID, a fresh one takes
+	// its place straight away. The next visit connects to the SFU before it
+	// publishes its membership, and the token it connects with is minted for
+	// whatever MemberID says at that moment: renewing only in Join would leave
+	// the bot on the old identity while its membership names the new one, and
+	// no client could find it from its second visit on.
+	defer m.renewMemberIDLocked()
 	if delayID := latestDelayID(keeper, m.delayID); delayID != "" {
 		// Fire the scheduled leave rather than cancelling it: that is exactly
 		// the event we want published.
@@ -246,6 +255,17 @@ func (m *StickyMembership) Leave(ctx context.Context) error {
 		return fmt.Errorf("retract sticky call membership: %w", err)
 	}
 	return nil
+}
+
+// renewMemberIDLocked replaces a retired member ID with a fresh one. Caller
+// must hold m.mu. Should the system's randomness fail, the ID stays retired
+// and Join tries again.
+func (m *StickyMembership) renewMemberIDLocked() {
+	memberID, err := newMemberID()
+	if err != nil {
+		return
+	}
+	m.memberID, m.left = memberID, false
 }
 
 // recover re-publishes the membership and arms a new delayed leave, after the

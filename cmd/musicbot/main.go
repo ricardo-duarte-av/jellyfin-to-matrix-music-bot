@@ -213,9 +213,10 @@ func run(configPath string, setupCrossSigning bool) error {
 		}
 		return nil
 	}
-	// memberIDs is the member each dialect's membership names, which a media
-	// key has to be filed under.
-	memberIDs := make(map[string]string)
+	// memberIDs gives the member each dialect's membership names now, which a
+	// media key has to be filed under. They are asked for every time: the
+	// sticky one changes with every visit to the call.
+	memberIDs := make(map[string]func() string)
 
 	// Join the call. The bot speaks two MatrixRTC dialects: the session-style
 	// membership Element Call has always used, and the MSC4143 membership with
@@ -307,7 +308,7 @@ func run(configPath string, setupCrossSigning bool) error {
 
 		legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectLegacy, Dial: dial})
 		members = append(members, membership)
-		memberIDs[rtc.DialectLegacy] = membership.MembershipID()
+		memberIDs[rtc.DialectLegacy] = membership.MembershipID
 		alias = sfu.Alias
 	}
 
@@ -401,7 +402,7 @@ func run(configPath string, setupCrossSigning bool) error {
 
 			legs = append(legs, rtc.NamedPublisher{Name: rtc.DialectSticky, Dial: dial})
 			members = append(members, rtc.StickyMember(sticky))
-			memberIDs[rtc.DialectSticky] = sticky.MemberID()
+			memberIDs[rtc.DialectSticky] = sticky.MemberID
 		}
 	}
 
@@ -515,7 +516,7 @@ func run(configPath string, setupCrossSigning bool) error {
 			var ids []string
 			for _, dialect := range call.Dialects() {
 				if memberID, ok := memberIDs[dialect]; ok {
-					ids = append(ids, memberID)
+					ids = append(ids, memberID())
 				}
 			}
 			keyShare.Update(targets, ids)

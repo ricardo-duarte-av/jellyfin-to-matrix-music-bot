@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -286,7 +287,21 @@ func TestStickyRankIsLastToExpire(t *testing.T) {
 // have the bot claim an identity its own leave event has just retired — and
 // clients that still hold the old entry would see two of it.
 func TestMemberIDIsRenewedOnRejoin(t *testing.T) {
-	client := acceptEverything(t)
+	var mu sync.Mutex
+	var sent []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		sent = append(sent, body)
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"event_id": "$sent"})
+	}))
+	t.Cleanup(srv.Close)
+	client, err := mautrix.NewClient(srv.URL, "@bot:example.org", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
 	m, err := NewStickyMembership(client, "!room:example.org", DefaultSlotID, DefaultStickyDuration)
 	if err != nil {
 		t.Fatal(err)
@@ -300,15 +315,29 @@ func TestMemberIDIsRenewedOnRejoin(t *testing.T) {
 	if err := m.Leave(ctx); err != nil {
 		t.Fatalf("Leave() = %v", err)
 	}
-	if got := m.MemberID(); got != first {
-		t.Errorf("member id changed on leaving, to %q; the leave has to name the membership it retracts", got)
+	mu.Lock()
+	leave := sent[len(sent)-1]
+	mu.Unlock()
+	if leave[StickyKeyField] != first {
+		t.Errorf("leave named sticky key %v; it has to retract membership %q", leave[StickyKeyField], first)
 	}
 
+	// The next visit dials the SFU before it publishes, with a token for
+	// whatever MemberID says now. Still saying the retired ID here is how the
+	// bot ended up connected under one identity while its membership named
+	// another.
+	next := m.MemberID()
+	if next == first {
+		t.Fatalf("member id still %q after leaving; the next token would be minted for a retired membership", first)
+	}
 	if err := m.Join(ctx); err != nil {
 		t.Fatalf("rejoin = %v", err)
 	}
-	if m.MemberID() == first {
-		t.Errorf("rejoined as member id %q; want a fresh one", first)
+	if got := m.MemberID(); got != next {
+		t.Errorf("rejoined as member id %q; want %q, the one the token was minted for", got, next)
+	}
+	if got := m.joinContent().Member.ID; got != next {
+		t.Errorf("membership names member id %q; want %q", got, next)
 	}
 	if err := m.Leave(ctx); err != nil {
 		t.Fatal(err)
